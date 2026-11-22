@@ -1,0 +1,53 @@
+# evilpot & evilpot-forefront Configuration Example
+rotation_interval_secs = 300
+persona_slots = 16
+master_seed = 4996236266642453553
+max_tarpit_connections = 1024
+tarpit_drip_bytes_per_sec = 256
+fake_archive_size_bytes = 268435456
+tarpit_verify_min_bytes = 2048
+tarpit_verify_min_ms = 3000
+sqli_time_delay_ms = 2500
+canary_webhook_url = "https://canary.internal.example.com/alert"
+max_tracked_sessions = 4096
+
+[admin]
+enabled = true
+# Set to "auto" to generate a 37-char random secret URL prefix at startup (e.g. /_ep_9f4b2c8e1a7d3065b8e2f1c4a9d0731e)
+path_prefix = "auto"
+# Optional header `X-Evilpot-Token` required to access the admin status/sessions/rotate endpoints
+# secret_token = "change_me_to_a_long_random_token"
+
+# ==============================================================================
+# The sections below ([sigil] and [http]) are used by `evilpot-forefront`
+# (the standalone reverse proxy & WAF-sink binary).
+# ==============================================================================
+[sigil]
+enabled = true
+min_confidence = 0.55
+overflow_warn_len = 4096
+overflow_crit_len = 8192
+inspect_headers = true
+inspect_body = true
+max_body_bytes = 32768
+exempt_paths = []
+
+[http]
+# Supported modes: "frontline_proxy" | "standalone" | "behind_proxy_sink"
+mode = "frontline_proxy"
+bind_addr = "0.0.0.0:8080"
+# upstream_http_url = "http://127.0.0.1:3000"
+sink_fallback_trap = "api_debug"
+real_ip_header = "x-real-ip"
+# required_ingress_header = "X-Evilpot-Sink: replace_with_shared_secret"
+
+enable_wordpress_trap = true
+enable_secret_leak_trap = true
+enable_sqli_trap = true
+enable_api_trap = true
+enable_tarpit_archives = true
+custom_wordpress_paths = ["/wp-login.php", "/wp-admin", "/wp-json", "/xmlrpc.php", "/wp-content/debug.log", "/wp-config.php.bak"]
+custom_secret_paths = ["/.env", "/.git/config", "/.git/HEAD", "/actuator/env", "/phpinfo.php"]
+custom_api_debug_paths = ["/api/v1/debug", "/api/debug", "/admin/debug", "/_debug"]
+custom_tarpit_suffixes = ["/heapdump", ".sql.gz", ".sql", "/backup.zip", "/backup.tar.gz"]
+scanner_user_agents = ["sqlmap", "nuclei", "nikto", "dirsearch", "gobuster", "feroxbuster", "ffuf", "masscan", "zgrab", "wpscan"]

@@ -1,0 +1,29 @@
+[package]
+name = "evilpot-forefront"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone reverse-proxy & WAF-sink HTTP deception honeypot powered by sigil-filter and evilpot."
+
+[[bin]]
+name = "evilpot-forefront"
+path = "src/main.rs"
+
+[dependencies]
+evilpot = { path = "../.." }
+sigil-filter.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach assets to (defaults to github.ref_name)"
+        required: false
+        type: string
+      publish_crate:
+        description: "Publish evilpot crate to crates.io"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  publish-crate:
+    name: Publish evilpot to crates.io
+    if: github.event_name == 'release' || inputs.publish_crate == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify evilpot crate tests & package
+        run: |
+          cargo test -p evilpot
+          cargo package -p evilpot --list
+
+      - name: Publish evilpot to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p evilpot
+
+  build-forefront:
+    name: Build evilpot-forefront (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs-on: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: tar.gz
+            bin: evilpot-forefront
+          - name: linux-aarch64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: tar.gz
+            bin: evilpot-forefront
+          - name: macos-aarch64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+            ext: tar.gz
+            bin: evilpot-forefront
+          - name: macos-x86_64
+            runs-on: macos-latest
+            target: x86_64-apple-darwin
+            ext: tar.gz
+            bin: evilpot-forefront
+          - name: windows-x86_64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: zip
+            bin: evilpot-forefront.exe
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build evilpot-forefront release binary
+        run: cargo build --release -p evilpot-forefront --target ${{ matrix.target }}
+
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist/pkg
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/pkg/
+          cp config.example.toml dist/pkg/
+          chmod +x "dist/pkg/${{ matrix.bin }}"
+          tar -C dist/pkg -czf "dist/evilpot-forefront-${{ matrix.name }}.tar.gz" \
+            "${{ matrix.bin }}" \
+            config.example.toml
+
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/pkg/
+          Copy-Item config.example.toml dist/pkg/
+          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/evilpot-forefront-${{ matrix.name }}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: evilpot-forefront-${{ matrix.name }}
+          path: dist/evilpot-forefront-${{ matrix.name }}.${{ matrix.ext }}
+
+  upload-release:
+    name: Attach Forefront Binaries to Release
+    needs: build-forefront
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum evilpot-forefront-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist/evilpot-forefront-*
+            dist/SHA256SUMS.txt
