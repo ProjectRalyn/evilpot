@@ -30,6 +30,14 @@ pub struct EvilpotConfig {
     pub sqli_time_delay_ms: u64,
     /// Canary token / webhook base URL embedded into fake `.env`, Git configs, and debug leaks.
     pub canary_webhook_url: String,
+    /// Optional fixed HTTP `Server` response header (e.g. `"nginx"`).
+    /// When `Some(s)`, overrides the per-persona `Server` header so deception responses match the
+    /// front proxy's real `Server` header (or omit `Server` if `s` is empty).
+    pub server_header: Option<String>,
+    /// Whether to emit backend fingerprint headers (`X-Powered-By`, `X-Backend-Node`, `X-Pingback`).
+    /// Disabled automatically when embedded behind a reverse proxy like Exposure so a single
+    /// request cannot fingerprint the honeypot by header differences.
+    pub emit_persona_headers: bool,
     /// Maximum number of active attacker verification sessions tracked in memory (LRU-bounded).
     pub max_tracked_sessions: usize,
     /// Management & telemetry panel configuration (customizable / randomized secret URL).
@@ -48,7 +56,9 @@ impl Default for EvilpotConfig {
             tarpit_verify_min_bytes: 2048,
             tarpit_verify_min_ms: 3000,
             sqli_time_delay_ms: 2500,
-            canary_webhook_url: "https://canary.internal.example.com/t".to_string(),
+            canary_webhook_url: "https://sso-auth.internal.corp/v1/introspect".to_string(),
+            server_header: None,
+            emit_persona_headers: true,
             max_tracked_sessions: 4096,
             admin: AdminPanelConfig::default(),
         }
@@ -93,18 +103,32 @@ impl AdminPanelConfig {
     pub fn resolved_prefix(&self) -> String {
         let trimmed = self.path_prefix.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
-            let mut rng = rand::thread_rng();
-            let rand_hex: String = (0..32)
-                .map(|_| {
-                    const HEX: &[u8] = b"0123456789abcdef";
-                    HEX[rng.gen_range(0..16)] as char
-                })
-                .collect();
-            format!("/_ep_{rand_hex}")
-        } else if trimmed.starts_with('/') {
+            return Self::random_prefix();
+        }
+
+        let normalized = if trimmed.starts_with('/') {
             trimmed.trim_end_matches('/').to_string()
         } else {
             format!("/{}", trimmed.trim_end_matches('/'))
+        };
+
+        // A bare "/" (or "//") trims down to an empty prefix, which would make
+        // `path.starts_with(prefix)` match EVERY request and hijack the whole site.
+        // Fall back to a fresh random prefix in that case.
+        if normalized.is_empty() || normalized == "/" {
+            return Self::random_prefix();
         }
+        normalized
+    }
+
+    fn random_prefix() -> String {
+        let mut rng = rand::thread_rng();
+        let rand_hex: String = (0..32)
+            .map(|_| {
+                const HEX: &[u8] = b"0123456789abcdef";
+                HEX[rng.gen_range(0..16)] as char
+            })
+            .collect();
+        format!("/_ep_{rand_hex}")
     }
 }

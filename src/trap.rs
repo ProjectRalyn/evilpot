@@ -164,9 +164,34 @@ pub enum TarpitKind {
 pub enum LfiTargetHint {
     EtcPasswd,
     EtcShadow,
+    EtcHostname,
+    EtcHosts,
+    EtcGroup,
+    EtcIssue,
+    EtcOsRelease,
+    EtcResolvConf,
+    EtcSshdConfig,
+    EtcNginxConf,
+    EtcCrontab,
+    ProcVersion,
+    ProcCmdline,
+    ProcCpuInfo,
+    ProcMemInfo,
     ProcSelfEnviron,
+    ProcSelfCmdline,
     DotEnv,
     WpConfig,
+    GitConfig,
+    GitHead,
+    AwsCredentials,
+    KubeConfig,
+    SshPrivateKey,
+    SshAuthorizedKeys,
+    Htaccess,
+    WebXml,
+    WinIni,
+    BootIni,
+    UnknownFile,
 }
 
 /// Specific deception trap response selected by `evilpot` for an [`AttackSignal`].
@@ -242,8 +267,11 @@ pub enum TrapVerdict {
     DeserializationJndiTrap { confidence_pct: u8 },
     /// LDAP Injection -> serves fake LDIF directory dump with SSHA password hash.
     LdapDirectoryDump { confidence_pct: u8 },
-    /// XSS -> serves legacy admin search page with bait non-HttpOnly session cookie.
-    XssBaitPage { confidence_pct: u8 },
+    /// XSS -> serves page reflecting the attacker's payload verbatim with bait non-HttpOnly session cookie.
+    XssBaitPage {
+        confidence_pct: u8,
+        reflected_payload: String,
+    },
     /// CRLF / HTTP Header Injection -> serves fake internal proxy header debug output.
     CrlfProxyDebug { confidence_pct: u8 },
 }
@@ -294,20 +322,7 @@ pub fn select_trap_for_signal(
             }
         }
         AttackCategory::PathTraversal => {
-            let target = if sample_lower.contains("shadow") || path_lower.contains("shadow") {
-                LfiTargetHint::EtcShadow
-            } else if sample_lower.contains("environ") || path_lower.contains("environ") {
-                LfiTargetHint::ProcSelfEnviron
-            } else if sample_lower.contains("wp-config") || path_lower.contains("wp-config") {
-                LfiTargetHint::WpConfig
-            } else if sample_lower.contains(".env")
-                || sample_lower.contains("credentials")
-                || path_lower.contains(".env")
-            {
-                LfiTargetHint::DotEnv
-            } else {
-                LfiTargetHint::EtcPasswd
-            };
+            let target = select_lfi_target(&sample_lower, &path_lower);
             TrapVerdict::PathTraversalLfi {
                 target,
                 confidence_pct,
@@ -326,7 +341,13 @@ pub fn select_trap_for_signal(
         AttackCategory::Xxe => TrapVerdict::XxeEntityLeak { confidence_pct },
         AttackCategory::Deserialization => TrapVerdict::DeserializationJndiTrap { confidence_pct },
         AttackCategory::LdapInjection => TrapVerdict::LdapDirectoryDump { confidence_pct },
-        AttackCategory::Xss => TrapVerdict::XssBaitPage { confidence_pct },
+        AttackCategory::Xss => {
+            let reflected_payload = extract_xss_reflection(signal, query, path);
+            TrapVerdict::XssBaitPage {
+                confidence_pct,
+                reflected_payload,
+            }
+        }
         AttackCategory::CrlfInjection => TrapVerdict::CrlfProxyDebug { confidence_pct },
         AttackCategory::BufferOverflow | AttackCategory::TarpitArchiveProbe => {
             let kind = if path_lower.contains("heapdump") || path_lower.ends_with(".hprof") {
@@ -421,15 +442,140 @@ fn select_api_trap(path_lower: &str) -> TrapVerdict {
     }
 }
 
+fn select_lfi_target(sample_lower: &str, path_lower: &str) -> LfiTargetHint {
+    let hay = format!("{path_lower} {sample_lower}");
+    if hay.contains("shadow") {
+        LfiTargetHint::EtcShadow
+    } else if hay.contains("passwd") {
+        LfiTargetHint::EtcPasswd
+    } else if hay.contains("sshd_config") {
+        LfiTargetHint::EtcSshdConfig
+    } else if hay.contains("nginx.conf") {
+        LfiTargetHint::EtcNginxConf
+    } else if hay.contains("hostname") {
+        LfiTargetHint::EtcHostname
+    } else if hay.contains("/etc/hosts") || hay.ends_with("hosts") {
+        LfiTargetHint::EtcHosts
+    } else if hay.contains("/etc/group") {
+        LfiTargetHint::EtcGroup
+    } else if hay.contains("os-release") {
+        LfiTargetHint::EtcOsRelease
+    } else if hay.contains("resolv.conf") {
+        LfiTargetHint::EtcResolvConf
+    } else if hay.contains("/etc/issue") {
+        LfiTargetHint::EtcIssue
+    } else if hay.contains("crontab") {
+        LfiTargetHint::EtcCrontab
+    } else if hay.contains("proc/self/environ") || hay.contains("environ") {
+        LfiTargetHint::ProcSelfEnviron
+    } else if hay.contains("proc/self/cmdline") {
+        LfiTargetHint::ProcSelfCmdline
+    } else if hay.contains("proc/cmdline") {
+        LfiTargetHint::ProcCmdline
+    } else if hay.contains("proc/version") {
+        LfiTargetHint::ProcVersion
+    } else if hay.contains("proc/cpuinfo") {
+        LfiTargetHint::ProcCpuInfo
+    } else if hay.contains("proc/meminfo") {
+        LfiTargetHint::ProcMemInfo
+    } else if hay.contains(".git/config") {
+        LfiTargetHint::GitConfig
+    } else if hay.contains(".git/head") {
+        LfiTargetHint::GitHead
+    } else if hay.contains("wp-config") {
+        LfiTargetHint::WpConfig
+    } else if hay.contains(".aws/credentials") || hay.contains("credentials") {
+        LfiTargetHint::AwsCredentials
+    } else if hay.contains(".kube/config") {
+        LfiTargetHint::KubeConfig
+    } else if hay.contains("authorized_keys") {
+        LfiTargetHint::SshAuthorizedKeys
+    } else if hay.contains("id_rsa") || hay.contains("id_ed25519") {
+        LfiTargetHint::SshPrivateKey
+    } else if hay.contains(".htaccess") {
+        LfiTargetHint::Htaccess
+    } else if hay.contains("web.xml") {
+        LfiTargetHint::WebXml
+    } else if hay.contains("win.ini") {
+        LfiTargetHint::WinIni
+    } else if hay.contains("boot.ini") {
+        LfiTargetHint::BootIni
+    } else if hay.contains(".env") {
+        LfiTargetHint::DotEnv
+    } else if sample_lower.trim_matches(|c| c == '.' || c == '/' || c == '\\').is_empty() {
+        LfiTargetHint::EtcPasswd
+    } else {
+        LfiTargetHint::UnknownFile
+    }
+}
+
+fn looks_like_xss_text(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains('<')
+        || l.contains('>')
+        || l.contains("javascript:")
+        || l.contains("vbscript:")
+        || l.contains("data:text/html")
+        || l.contains("alert(")
+        || l.contains("prompt(")
+        || l.contains("confirm(")
+        || l.contains("eval(")
+        || l.contains("document.")
+        || l.contains("onerror=")
+        || l.contains("onload=")
+        || l.contains("onfocus=")
+        || l.contains("onmouseover=")
+        || l.contains("onclick=")
+        || l.contains("ontoggle=")
+}
+
+fn strip_leading_param_name(decoded: &str) -> &str {
+    if let Some((k, v)) = decoded.split_once('=') {
+        if !k.is_empty()
+            && k.len() <= 48
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return v;
+        }
+    }
+    decoded
+}
+
+fn extract_xss_reflection(signal: &AttackSignal, query: Option<&str>, path: &str) -> String {
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if let Some((_, val)) = pair.split_once('=') {
+                let dec_val = percent_decode_lossy(val);
+                if looks_like_xss_text(&dec_val) {
+                    return dec_val.chars().take(512).collect();
+                }
+            }
+            let dec_pair = percent_decode_lossy(pair);
+            if looks_like_xss_text(&dec_pair) {
+                return strip_leading_param_name(&dec_pair).chars().take(512).collect();
+            }
+        }
+    }
+    if let Some(ref mp) = signal.matched_payload {
+        let dec = percent_decode_lossy(mp);
+        let stripped = strip_leading_param_name(&dec);
+        if !stripped.is_empty() {
+            return stripped.chars().take(512).collect();
+        }
+    }
+    percent_decode_lossy(path).chars().take(512).collect()
+}
+
 /// Extract a plausible shell command from a command-injection payload (e.g. `host=127.0.0.1;id` -> `id`,
-/// `q=$(whoami)` -> `whoami`) so we can execute it safely inside `FakeShellSession`!
+/// `host=127.0.0.1;id;#` -> `id`, `q=$(whoami)` -> `whoami`) so we can execute it safely inside `FakeShellSession`!
 pub fn extract_injected_command(sample: &str) -> String {
     let decoded = percent_decode_lossy(sample);
     if let Some(start) = decoded.find("$(") {
         if let Some(end) = decoded[start + 2..].find(')') {
             let inner = decoded[start + 2..start + 2 + end].trim();
             if !inner.is_empty() {
-                return inner.replace("${IFS}", " ");
+                return inner.replace("${IFS}", " ").replace("$IFS", " ");
             }
         }
     }
@@ -437,20 +583,46 @@ pub fn extract_injected_command(sample: &str) -> String {
         if let Some(end) = decoded[start + 1..].find('`') {
             let inner = decoded[start + 1..start + 1 + end].trim();
             if !inner.is_empty() {
-                return inner.replace("${IFS}", " ");
+                return inner.replace("${IFS}", " ").replace("$IFS", " ");
             }
         }
     }
-    for sep in [";", "&&", "||", "|"] {
-        if let Some((_, right)) = decoded.rsplit_once(sep) {
-            let candidate = right.trim().replace("${IFS}", " ");
-            if !candidate.is_empty() {
-                return candidate;
+
+    let mut earliest: Option<(usize, usize)> = None;
+    for sep in ["&&", "||", ";", "|", "\n", "\r"] {
+        if let Some(idx) = decoded.find(sep) {
+            match earliest {
+                Some((best_idx, _)) if idx >= best_idx => {}
+                _ => earliest = Some((idx, sep.len())),
             }
         }
     }
-    let cleaned = decoded.trim().replace("${IFS}", " ");
-    if !cleaned.is_empty() && !cleaned.contains('=') {
+
+    let candidate_slice = if let Some((idx, len)) = earliest {
+        &decoded[idx + len..]
+    } else {
+        strip_leading_param_name(decoded.trim())
+    };
+
+    let normalized = candidate_slice
+        .replace("${IFS}", " ")
+        .replace("$IFS", " ");
+
+    let mut segments = Vec::new();
+    for raw_seg in normalized.split([';', '\n', '\r']) {
+        let trimmed = raw_seg.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        segments.push(trimmed);
+    }
+
+    if !segments.is_empty() {
+        return segments.join("; ");
+    }
+
+    let cleaned = decoded.trim().replace("${IFS}", " ").replace("$IFS", " ");
+    if !cleaned.is_empty() && !cleaned.contains('=') && !cleaned.starts_with('#') {
         return cleaned;
     }
     "id".to_string()
@@ -529,13 +701,15 @@ fn refine_sqli_verdict(
 
 fn evaluate_sqlmap_char_probe(query_upper: &str, secret_row: &str) -> (bool, usize) {
     let pos_1based = extract_char_pos(query_upper).unwrap_or(1);
-    let threshold = extract_number_after(query_upper, ">").unwrap_or(64) as u8;
+    // Keep the threshold as u64: cast to u8 would silently wrap values >255
+    // (e.g. `ORD(...)>300`) and invert the boolean response.
+    let threshold = extract_number_after(query_upper, ">").unwrap_or(64);
 
     let secret_bytes = secret_row.as_bytes();
     if pos_1based == 0 || pos_1based > secret_bytes.len() {
         return (false, pos_1based);
     }
-    let actual_byte = secret_bytes[pos_1based - 1];
+    let actual_byte = secret_bytes[pos_1based - 1] as u64;
     (actual_byte > threshold, pos_1based)
 }
 

@@ -13,6 +13,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+// Upper bounds on per-session collections so a single attacker IP cannot exhaust
+// memory by emitting an unbounded number of unique paths / commands / IOCs.
+const MAX_DISTINCT_PATHS: usize = 128;
+const MAX_RCE_COMMANDS: usize = 128;
+const MAX_CAPTURED_IOCS: usize = 256;
+const MAX_EVIDENCE: usize = 128;
+
 /// Verification status indicating how strongly `evilpot` has confirmed that a WAF-diverted
 /// client is actively exploiting a vulnerability rather than triggering an isolated false positive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -125,6 +132,13 @@ impl AttackerSessionState {
         }
     }
 
+    /// Append verification evidence while keeping the per-session evidence log bounded.
+    fn push_evidence(&mut self, ev: VerificationEvidence) {
+        if self.evidence.len() < MAX_EVIDENCE {
+            self.evidence.push(ev);
+        }
+    }
+
     fn to_report(&self) -> AttackerSessionReport {
         let mut paths: Vec<String> = self.distinct_paths.iter().cloned().collect();
         paths.sort();
@@ -207,6 +221,7 @@ pub struct EvilpotEngine {
     config: EvilpotConfig,
     resolved_admin_prefix: String,
     snapshot: RwLock<Arc<PersonaSnapshot>>,
+    previous_snapshots: RwLock<VecDeque<Arc<PersonaSnapshot>>>,
     epoch_counter: AtomicU64,
     pub metrics: EvilpotMetrics,
     recent_events: Mutex<VecDeque<ThreatEvent>>,
@@ -231,6 +246,7 @@ impl EvilpotEngine {
             config,
             resolved_admin_prefix,
             snapshot: RwLock::new(Arc::new(snapshot)),
+            previous_snapshots: RwLock::new(VecDeque::with_capacity(4)),
             epoch_counter: AtomicU64::new(initial_epoch),
             metrics,
             recent_events: Mutex::new(VecDeque::with_capacity(256)),
@@ -253,20 +269,101 @@ impl EvilpotEngine {
             .clone()
     }
 
-    /// Deterministically select a pre-baked `PrebakedPersona` for `client_ip` in the current epoch.
+    /// Deterministically select a pre-baked `PrebakedPersona` for `client_ip`.
+    /// Pinning is stable across epoch rotations so a client's server hostname/Server header never flips mid-session.
     pub fn select_persona(&self, client_ip: IpAddr) -> Arc<PrebakedPersona> {
         let snap = self.current_snapshot();
         let subnet_key = normalize_ip_subnet(client_ip);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        snap.epoch_id.hash(&mut hasher);
+        self.config.master_seed.hash(&mut hasher);
         subnet_key.hash(&mut hasher);
         let idx = (hasher.finish() as usize) % snap.personas.len();
         snap.personas[idx].clone()
     }
 
+    fn match_persona_canary(
+        p: &PrebakedPersona,
+        path: &str,
+        query: Option<&str>,
+        headers: &HeaderMap,
+    ) -> Option<VerificationEvidence> {
+        // 1. Canary Vault Export Path or Canary Token ID in URI path/query
+        if path == p.canary_endpoint_path
+            || path.contains(&p.canary_token_id)
+            || p.extra_canary_paths.iter().any(|cp| path == cp)
+        {
+            return Some(VerificationEvidence::CanaryTriggered {
+                kind: "canary_endpoint_path".to_string(),
+                token_or_path: path.to_string(),
+            });
+        }
+        if let Some(q) = query {
+            if q.contains(&p.canary_api_key)
+                || q.contains(&p.canary_aws_access_key)
+                || q.contains(&p.canary_token_id)
+            {
+                return Some(VerificationEvidence::CanaryTriggered {
+                    kind: "canary_query_token".to_string(),
+                    token_or_path: p.canary_api_key.clone(),
+                });
+            }
+            for (kind, tok) in &p.extra_canary_tokens {
+                if q.contains(tok) {
+                    return Some(VerificationEvidence::CanaryTriggered {
+                        kind: format!("query:{kind}"),
+                        token_or_path: tok.clone(),
+                    });
+                }
+            }
+        }
+
+        // 2. Implanted API key / AWS key / JWT secret in Authorization or custom API headers
+        for hdr_name in [
+            "authorization",
+            "x-api-key",
+            "x-evilpot-token",
+            "x-legacy-token",
+            "x-debug-bypass-token",
+            "x-vault-token",
+            "x-internal-gateway-token",
+        ] {
+            if let Some(val) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
+                if val.contains(&p.canary_api_key)
+                    || val.contains(&p.canary_aws_access_key)
+                    || val.contains(&p.canary_jwt_secret[..20])
+                {
+                    return Some(VerificationEvidence::CanaryTriggered {
+                        kind: format!("header:{hdr_name}"),
+                        token_or_path: p.canary_api_key.clone(),
+                    });
+                }
+                for (kind, tok) in &p.extra_canary_tokens {
+                    if val.contains(tok) {
+                        return Some(VerificationEvidence::CanaryTriggered {
+                            kind: format!("header:{hdr_name}:{kind}"),
+                            token_or_path: tok.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 3. Implanted XSS / WordPress bait session cookie replayed
+        if let Some(cookie) = headers.get(http::header::COOKIE).and_then(|v| v.to_str().ok()) {
+            if cookie.contains(&p.canary_cookie_value) {
+                return Some(VerificationEvidence::CanaryTriggered {
+                    kind: "cookie:admin_session_id".to_string(),
+                    token_or_path: p.canary_cookie_value[..16].to_string(),
+                });
+            }
+        }
+
+        None
+    }
+
     /// Check whether an incoming HTTP request (even one that might look syntactically benign to a WAF!)
     /// replays an implanted canary credential, cookie, API key, or secret vault export path from any
-    /// active persona in the current snapshot.
+    /// active or recently rotated persona snapshot.
     ///
     /// Callers (like Exposure or `evilpot-forefront`) can call this on incoming requests to catch
     /// attackers trying to use credentials stolen from an earlier honeypot response!
@@ -280,58 +377,20 @@ impl EvilpotEngine {
         let snap = self.current_snapshot();
         let assigned = self.select_persona(client_ip);
 
-        // Check assigned persona first (O(1) fast path), then any other slot in current snapshot
-        let personas_to_check = std::iter::once(&assigned).chain(snap.personas.iter());
-
-        for p in personas_to_check {
-            // 1. Canary Vault Export Path or Canary Token ID in URI path/query
-            if path == p.canary_endpoint_path || path.contains(&p.canary_token_id) {
-                return Some(VerificationEvidence::CanaryTriggered {
-                    kind: "canary_endpoint_path".to_string(),
-                    token_or_path: p.canary_endpoint_path.clone(),
-                });
+        // Check assigned persona first (O(1) fast path), then all slots in current snapshot
+        for p in std::iter::once(&assigned).chain(snap.personas.iter()) {
+            if let Some(ev) = Self::match_persona_canary(p, path, query, headers) {
+                return Some(ev);
             }
-            if let Some(q) = query {
-                if q.contains(&p.canary_api_key)
-                    || q.contains(&p.canary_aws_access_key)
-                    || q.contains(&p.canary_token_id)
-                {
-                    return Some(VerificationEvidence::CanaryTriggered {
-                        kind: "canary_query_token".to_string(),
-                        token_or_path: p.canary_api_key.clone(),
-                    });
-                }
-            }
+        }
 
-            // 2. Implanted API key / AWS key / JWT secret in Authorization or custom API headers
-            for hdr_name in [
-                "authorization",
-                "x-api-key",
-                "x-evilpot-token",
-                "x-legacy-token",
-                "x-debug-bypass-token",
-                "x-vault-token",
-            ] {
-                if let Some(val) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
-                    if val.contains(&p.canary_api_key)
-                        || val.contains(&p.canary_aws_access_key)
-                        || val.contains(&p.canary_jwt_secret[..20])
-                    {
-                        return Some(VerificationEvidence::CanaryTriggered {
-                            kind: format!("header:{hdr_name}"),
-                            token_or_path: p.canary_api_key.clone(),
-                        });
+        // Also check recent prior snapshots so stolen cookies/tokens remain valid across epoch rotation
+        if let Ok(prev) = self.previous_snapshots.read() {
+            for old_snap in prev.iter() {
+                for p in &old_snap.personas {
+                    if let Some(ev) = Self::match_persona_canary(p, path, query, headers) {
+                        return Some(ev);
                     }
-                }
-            }
-
-            // 3. Implanted XSS / WordPress bait session cookie replayed
-            if let Some(cookie) = headers.get(http::header::COOKIE).and_then(|v| v.to_str().ok()) {
-                if cookie.contains(&p.canary_cookie_value) {
-                    return Some(VerificationEvidence::CanaryTriggered {
-                        kind: "cookie:admin_session_id".to_string(),
-                        token_or_path: p.canary_cookie_value[..16].to_string(),
-                    });
                 }
             }
         }
@@ -387,13 +446,17 @@ impl EvilpotEngine {
             let prev_status = session.status;
             session.last_seen_unix = now_unix;
             session.total_trapped_requests += 1;
-            session.distinct_paths.insert(path.to_string());
+            if session.distinct_paths.len() < MAX_DISTINCT_PATHS
+                || session.distinct_paths.contains(path)
+            {
+                session.distinct_paths.insert(path.to_string());
+            }
 
             // 1. Canary credential / endpoint replay -> immediate VerifiedExploit!
             if let Some(ev) = canary_evidence {
                 session.canary_triggers += 1;
                 session.status = ExploitVerificationStatus::VerifiedExploit;
-                session.evidence.push(ev.clone());
+                session.push_evidence(ev.clone());
                 new_evidence.push(ev);
                 self.metrics
                     .canary_verifications
@@ -418,7 +481,7 @@ impl EvilpotEngine {
                             probe_count: session.sqli_probes,
                             distinct_char_positions: session.sqli_positions.len(),
                         };
-                        session.evidence.push(ev.clone());
+                        session.push_evidence(ev.clone());
                         new_evidence.push(ev);
                     }
                 }
@@ -432,16 +495,20 @@ impl EvilpotEngine {
                             probe_count: session.sqli_probes,
                             distinct_char_positions: session.sqli_positions.len(),
                         };
-                        session.evidence.push(ev.clone());
+                        session.push_evidence(ev.clone());
                         new_evidence.push(ev);
                     }
                 }
                 TrapVerdict::CommandInjectionRce { extracted_cmd, .. } => {
-                    session.rce_commands.push(extracted_cmd.clone());
+                    if session.rce_commands.len() < MAX_RCE_COMMANDS {
+                        session.rce_commands.push(extracted_cmd.clone());
+                    }
                     let mut iocs = Vec::new();
                     if let Some(sr) = shell_result {
                         for ioc in &sr.captured_indicators {
-                            if !session.captured_iocs.contains(ioc) {
+                            if session.captured_iocs.len() < MAX_CAPTURED_IOCS
+                                && !session.captured_iocs.contains(ioc)
+                            {
                                 session.captured_iocs.push(ioc.clone());
                             }
                             iocs.push(ioc.clone());
@@ -457,7 +524,7 @@ impl EvilpotEngine {
                         last_command: extracted_cmd.clone(),
                         captured_iocs: iocs,
                     };
-                    session.evidence.push(ev.clone());
+                    session.push_evidence(ev.clone());
                     new_evidence.push(ev);
                 }
                 _ => {}
@@ -471,7 +538,7 @@ impl EvilpotEngine {
                 let ev = VerificationEvidence::MultiPathRecon {
                     distinct_paths_probed: session.distinct_paths.len(),
                 };
-                session.evidence.push(ev.clone());
+                session.push_evidence(ev.clone());
                 new_evidence.push(ev);
             }
 
@@ -536,7 +603,7 @@ impl EvilpotEngine {
                         bytes_read: session.tarpit_bytes_consumed,
                         duration_ms: session.tarpit_max_duration_ms,
                     };
-                    session.evidence.push(ev.clone());
+                    session.push_evidence(ev.clone());
                     verified_event = Some((session.status, ev));
                 }
             }
@@ -604,12 +671,18 @@ impl EvilpotEngine {
             &self.config.canary_webhook_url,
         ));
 
-        {
+        let old_snapshot = {
             let mut guard = self
                 .snapshot
                 .write()
                 .expect("EvilpotEngine snapshot write lock poisoned");
-            *guard = new_snapshot.clone();
+            std::mem::replace(&mut *guard, new_snapshot.clone())
+        };
+        if let Ok(mut prev) = self.previous_snapshots.write() {
+            if prev.len() >= 4 {
+                prev.pop_front();
+            }
+            prev.push_back(old_snapshot);
         }
 
         self.metrics.current_epoch.store(next_epoch, Ordering::Relaxed);

@@ -1,3 +1,4 @@
+use crate::config::EvilpotConfig;
 use crate::engine::{
     AttackerSessionReport, EvilpotEngine, TarpitPermit, VerificationEvidence,
 };
@@ -81,7 +82,16 @@ impl EvilpotEngine {
             None,
             format!("{method} {uri_display} (CANARY TRIGGERED: {trigger_desc})"),
         );
-        let response = build_trap_http_response(self, client_ip, &persona, &verdict, None).await;
+        let response = build_trap_http_response_with_ctx(
+            self,
+            client_ip,
+            &persona,
+            &verdict,
+            None,
+            Some(path),
+            Some(headers),
+        )
+        .await;
 
         Some(DeceptionOutcome {
             response,
@@ -161,8 +171,16 @@ impl EvilpotEngine {
             detail,
         );
 
-        let response =
-            build_trap_http_response(self, client_ip, &persona, &verdict, shell_res).await;
+        let response = build_trap_http_response_with_ctx(
+            self,
+            client_ip,
+            &persona,
+            &verdict,
+            shell_res,
+            Some(path),
+            Some(headers),
+        )
+        .await;
 
         DeceptionOutcome {
             response,
@@ -294,20 +312,56 @@ pub async fn build_trap_http_response(
     verdict: &TrapVerdict,
     shell_res: Option<crate::shell::ShellExecResult>,
 ) -> Response<EvilpotBody> {
+    build_trap_http_response_with_ctx(engine, client_ip, persona, verdict, shell_res, None, None)
+        .await
+}
+
+pub async fn build_trap_http_response_with_ctx(
+    engine: &Arc<EvilpotEngine>,
+    client_ip: IpAddr,
+    persona: &Arc<PrebakedPersona>,
+    verdict: &TrapVerdict,
+    shell_res: Option<crate::shell::ShellExecResult>,
+    req_path: Option<&str>,
+    req_headers: Option<&HeaderMap>,
+) -> Response<EvilpotBody> {
+    let cfg = engine.config();
     match verdict {
-        TrapVerdict::CanaryVaultExport { .. } => static_response(
-            persona,
-            StatusCode::OK,
-            "application/json; charset=UTF-8",
-            persona.canary_vault_export_json.clone(),
-            false,
-        ),
+        TrapVerdict::CanaryVaultExport { trigger } => {
+            let is_cookie_replay = trigger.starts_with("cookie:");
+            let path_is_api = req_path.map(|p| p.starts_with("/api/")).unwrap_or(false);
+            let accepts_json = req_headers
+                .and_then(|h| h.get(header::ACCEPT))
+                .and_then(|v| v.to_str().ok())
+                .map(|a| a.contains("application/json") && !a.contains("text/html"))
+                .unwrap_or(false);
+            if is_cookie_replay && !path_is_api && !accepts_json {
+                static_response(
+                    cfg,
+                    persona,
+                    StatusCode::OK,
+                    "text/html; charset=UTF-8",
+                    persona.canary_admin_panel_html.clone(),
+                    false,
+                )
+            } else {
+                static_response(
+                    cfg,
+                    persona,
+                    StatusCode::OK,
+                    "application/json; charset=UTF-8",
+                    persona.canary_vault_export_json.clone(),
+                    false,
+                )
+            }
+        }
         TrapVerdict::WordPressLogin { is_post_attempt } => {
             if *is_post_attempt {
                 if let Some(_permit) = engine.try_acquire_tarpit() {
                     tokio::time::sleep(Duration::from_millis(1800)).await;
                 }
                 static_response(
+                    cfg,
                     persona,
                     StatusCode::OK,
                     "text/html; charset=UTF-8",
@@ -316,6 +370,7 @@ pub async fn build_trap_http_response(
                 )
             } else {
                 static_response(
+                    cfg,
                     persona,
                     StatusCode::OK,
                     "text/html; charset=UTF-8",
@@ -325,6 +380,7 @@ pub async fn build_trap_http_response(
             }
         }
         TrapVerdict::WordPressRestIndex => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -332,6 +388,7 @@ pub async fn build_trap_http_response(
             true,
         ),
         TrapVerdict::WordPressUsersJson => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -339,6 +396,7 @@ pub async fn build_trap_http_response(
             true,
         ),
         TrapVerdict::WordPressPostsJson => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -350,6 +408,7 @@ pub async fn build_trap_http_response(
                 tokio::time::sleep(Duration::from_millis(2000)).await;
             }
             static_response(
+                cfg,
                 persona,
                 StatusCode::OK,
                 "text/xml; charset=UTF-8",
@@ -358,6 +417,7 @@ pub async fn build_trap_http_response(
             )
         }
         TrapVerdict::WordPressConfigBackup => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/plain; charset=UTF-8",
@@ -365,6 +425,7 @@ pub async fn build_trap_http_response(
             true,
         ),
         TrapVerdict::WordPressDebugLog => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/plain; charset=UTF-8",
@@ -372,6 +433,7 @@ pub async fn build_trap_http_response(
             true,
         ),
         TrapVerdict::WordPressAdminAjax => static_response(
+            cfg,
             persona,
             StatusCode::BAD_REQUEST,
             "application/json; charset=UTF-8",
@@ -379,6 +441,7 @@ pub async fn build_trap_http_response(
             true,
         ),
         TrapVerdict::WordPressReadme => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/html; charset=UTF-8",
@@ -386,6 +449,7 @@ pub async fn build_trap_http_response(
             true,
         ),
         TrapVerdict::DotEnvLeak => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/plain; charset=UTF-8",
@@ -393,6 +457,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::GitConfigLeak => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/plain; charset=UTF-8",
@@ -400,6 +465,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::GitHeadLeak => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/plain; charset=UTF-8",
@@ -407,6 +473,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::SpringActuatorEnv => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/vnd.spring-boot.actuator.v3+json; charset=UTF-8",
@@ -414,6 +481,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::PhpInfo => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/html; charset=UTF-8",
@@ -421,6 +489,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::GraphqlIntrospection => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -428,6 +497,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::OpenApiSchema => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -435,6 +505,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::ApiDebugEndpoint => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -448,6 +519,7 @@ pub async fn build_trap_http_response(
                 persona.sqli_error_mysql_html.clone()
             };
             static_response(
+                cfg,
                 persona,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "text/html; charset=UTF-8",
@@ -461,13 +533,21 @@ pub async fn build_trap_http_response(
             } else {
                 persona.sqli_boolean_false_html.clone()
             };
-            static_response(persona, StatusCode::OK, "text/html; charset=UTF-8", body, false)
+            static_response(
+                cfg,
+                persona,
+                StatusCode::OK,
+                "text/html; charset=UTF-8",
+                body,
+                false,
+            )
         }
         TrapVerdict::SqlInjectionTimeBlind { delay_ms } => {
             if let Some(_permit) = engine.try_acquire_tarpit() {
                 tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
             }
             static_response(
+                cfg,
                 persona,
                 StatusCode::OK,
                 "text/html; charset=UTF-8",
@@ -476,15 +556,17 @@ pub async fn build_trap_http_response(
             )
         }
         TrapVerdict::TarpitStream { kind } => {
-            let (content_type, disposition, chunk) = match kind {
+            let (content_type, disposition, hdr_prefix, chunk) = match kind {
                 TarpitKind::GzipSqlBackup => (
                     "application/gzip",
                     "attachment; filename=\"prod_ledger_full_dump.sql.gz\"",
+                    persona.tarpit_gzip_header.clone(),
                     persona.tarpit_gzip_chunk.clone(),
                 ),
                 TarpitKind::JavaHprof => (
                     "application/octet-stream",
                     "attachment; filename=\"heapdump.hprof\"",
+                    persona.tarpit_hprof_header.clone(),
                     persona.tarpit_hprof_chunk.clone(),
                 ),
             };
@@ -501,7 +583,8 @@ pub async fn build_trap_http_response(
                     advertised_size,
                     drip_rate,
                     permit,
-                );
+                )
+                .with_header_prefix(hdr_prefix);
                 let mut resp = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, content_type)
@@ -509,28 +592,76 @@ pub async fn build_trap_http_response(
                     .header(header::CONTENT_LENGTH, advertised_size.to_string())
                     .body(drip_body.boxed())
                     .unwrap();
-                inject_persona_headers(persona, &mut resp, false);
+                inject_headers_with_config(cfg, persona, &mut resp, false);
                 resp
             } else {
-                static_response(persona, StatusCode::OK, content_type, chunk, false)
+                let mut full = Vec::with_capacity(hdr_prefix.len() + chunk.len());
+                full.extend_from_slice(&hdr_prefix);
+                full.extend_from_slice(&chunk);
+                static_response(
+                    cfg,
+                    persona,
+                    StatusCode::OK,
+                    content_type,
+                    Bytes::from(full),
+                    false,
+                )
             }
         }
         TrapVerdict::PathTraversalLfi { target, .. } => {
-            let body = match target {
-                LfiTargetHint::EtcPasswd => persona.lfi_etc_passwd_body.clone(),
-                LfiTargetHint::EtcShadow => Bytes::from(
+            let vfs_file = |key: &str| -> Bytes {
+                Bytes::from(
                     persona
                         .shell_vfs
                         .files
-                        .get("/etc/shadow")
+                        .get(key)
                         .cloned()
                         .unwrap_or_default(),
-                ),
-                LfiTargetHint::ProcSelfEnviron => persona.lfi_proc_environ_body.clone(),
-                LfiTargetHint::DotEnv => persona.dotenv_body.clone(),
-                LfiTargetHint::WpConfig => persona.wp_config_bak.clone(),
+                )
             };
-            static_response(persona, StatusCode::OK, "text/plain; charset=UTF-8", body, false)
+            let home = format!("/home/{}", persona.shell_vfs.default_user);
+            let (status, body) = match target {
+                LfiTargetHint::EtcPasswd => (StatusCode::OK, persona.lfi_etc_passwd_body.clone()),
+                LfiTargetHint::EtcShadow => (StatusCode::OK, vfs_file("/etc/shadow")),
+                LfiTargetHint::EtcHostname => {
+                    let mut h = persona.shell_vfs.files.get("/etc/hostname").cloned().unwrap_or_default();
+                    if !h.ends_with('\n') {
+                        h.push('\n');
+                    }
+                    (StatusCode::OK, Bytes::from(h))
+                }
+                LfiTargetHint::EtcHosts => (StatusCode::OK, vfs_file("/etc/hosts")),
+                LfiTargetHint::EtcGroup => (StatusCode::OK, vfs_file("/etc/group")),
+                LfiTargetHint::EtcIssue => (StatusCode::OK, vfs_file("/etc/issue")),
+                LfiTargetHint::EtcOsRelease => (StatusCode::OK, vfs_file("/etc/os-release")),
+                LfiTargetHint::EtcResolvConf => (StatusCode::OK, vfs_file("/etc/resolv.conf")),
+                LfiTargetHint::EtcSshdConfig => (StatusCode::OK, vfs_file("/etc/ssh/sshd_config")),
+                LfiTargetHint::EtcNginxConf => (StatusCode::OK, vfs_file("/etc/nginx/nginx.conf")),
+                LfiTargetHint::EtcCrontab => (StatusCode::OK, vfs_file("/etc/crontab")),
+                LfiTargetHint::ProcVersion => (StatusCode::OK, vfs_file("/proc/version")),
+                LfiTargetHint::ProcCmdline => (StatusCode::OK, vfs_file("/proc/cmdline")),
+                LfiTargetHint::ProcCpuInfo => (StatusCode::OK, vfs_file("/proc/cpuinfo")),
+                LfiTargetHint::ProcMemInfo => (StatusCode::OK, vfs_file("/proc/meminfo")),
+                LfiTargetHint::ProcSelfEnviron => (StatusCode::OK, persona.lfi_proc_environ_body.clone()),
+                LfiTargetHint::ProcSelfCmdline => (StatusCode::OK, vfs_file("/proc/self/cmdline")),
+                LfiTargetHint::DotEnv => (StatusCode::OK, persona.dotenv_body.clone()),
+                LfiTargetHint::WpConfig => (StatusCode::OK, persona.wp_config_bak.clone()),
+                LfiTargetHint::GitConfig => (StatusCode::OK, persona.git_config_body.clone()),
+                LfiTargetHint::GitHead => (StatusCode::OK, persona.git_head_body.clone()),
+                LfiTargetHint::AwsCredentials => (StatusCode::OK, vfs_file(&format!("{home}/.aws/credentials"))),
+                LfiTargetHint::KubeConfig => (StatusCode::OK, vfs_file(&format!("{home}/.kube/config"))),
+                LfiTargetHint::SshPrivateKey => (StatusCode::OK, vfs_file(&format!("{home}/.ssh/id_rsa"))),
+                LfiTargetHint::SshAuthorizedKeys => (StatusCode::OK, vfs_file(&format!("{home}/.ssh/authorized_keys"))),
+                LfiTargetHint::Htaccess => (StatusCode::OK, persona.htaccess_body.clone()),
+                LfiTargetHint::WebXml => (StatusCode::OK, persona.web_xml_body.clone()),
+                LfiTargetHint::WinIni => (StatusCode::OK, persona.win_ini_body.clone()),
+                LfiTargetHint::BootIni => (StatusCode::OK, persona.boot_ini_body.clone()),
+                LfiTargetHint::UnknownFile => (
+                    StatusCode::NOT_FOUND,
+                    Bytes::from_static(b"No such file or directory\n"),
+                ),
+            };
+            static_response(cfg, persona, status, "text/plain; charset=UTF-8", body, false)
         }
         TrapVerdict::CommandInjectionRce { extracted_cmd, .. } => {
             let res = shell_res
@@ -541,6 +672,7 @@ pub async fn build_trap_http_response(
                 }
             }
             static_response(
+                cfg,
                 persona,
                 StatusCode::OK,
                 "text/plain; charset=UTF-8",
@@ -549,6 +681,7 @@ pub async fn build_trap_http_response(
             )
         }
         TrapVerdict::SsrfCloudMetadata { .. } => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -556,6 +689,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::SstiTemplateEval { .. } => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/html; charset=UTF-8",
@@ -563,6 +697,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::NoSqlAdminDump { .. } => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/json; charset=UTF-8",
@@ -570,6 +705,7 @@ pub async fn build_trap_http_response(
             false,
         ),
         TrapVerdict::XxeEntityLeak { .. } => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "application/xml; charset=UTF-8",
@@ -581,6 +717,7 @@ pub async fn build_trap_http_response(
                 tokio::time::sleep(Duration::from_millis(900)).await;
             }
             static_response(
+                cfg,
                 persona,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "text/plain; charset=UTF-8",
@@ -589,19 +726,59 @@ pub async fn build_trap_http_response(
             )
         }
         TrapVerdict::LdapDirectoryDump { .. } => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/plain; charset=UTF-8",
             persona.ldap_dump_ldif.clone(),
             false,
         ),
-        TrapVerdict::XssBaitPage { .. } => {
+        TrapVerdict::XssBaitPage {
+            reflected_payload, ..
+        } => {
+            let lower = reflected_payload.trim_start().to_ascii_lowercase();
+            let uri_link = if lower.starts_with("javascript:")
+                || lower.starts_with("vbscript:")
+                || lower.starts_with("data:")
+            {
+                format!(
+                    r#"<p><a id="continue-link" href="{reflected_payload}">Continue to requested page</a></p>"#
+                )
+            } else {
+                String::new()
+            };
+            let html = format!(
+                r#"<!DOCTYPE html><html><head><meta charset="utf-8" /><title>Portal Search</title></head>
+<body>
+<h1>Portal Search</h1>
+<form method="GET" action="/search">
+  <input type="text" name="q" value="{reflected_payload}" />
+  <button type="submit">Search</button>
+</form>
+<div id="search-echo">No matching records found for: {reflected_payload}</div>
+{uri_link}
+</body></html>
+"#
+            );
             let mut resp = static_response(
+                cfg,
                 persona,
                 StatusCode::OK,
                 "text/html; charset=UTF-8",
-                persona.xss_bait_html.clone(),
+                Bytes::from(html),
                 false,
+            );
+            // Reflect the payload for bait realism, but sandbox the document so an
+            // attacker payload can never actually execute as script on the protected
+            // origin. This stops a benign WAF false-positive (classified as XSS) from
+            // turning the honeypot into a real reflected-XSS sink for the real site.
+            resp.headers_mut().insert(
+                HeaderName::from_static("content-security-policy"),
+                HeaderValue::from_static("sandbox; default-src 'none'"),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
             );
             if let Ok(cookie) = HeaderValue::from_str(&format!(
                 "admin_session_id={}; Path=/",
@@ -612,6 +789,7 @@ pub async fn build_trap_http_response(
             resp
         }
         TrapVerdict::CrlfProxyDebug { .. } => static_response(
+            cfg,
             persona,
             StatusCode::OK,
             "text/plain; charset=UTF-8",
@@ -622,6 +800,7 @@ pub async fn build_trap_http_response(
 }
 
 fn static_response(
+    cfg: &EvilpotConfig,
     persona: &PrebakedPersona,
     status: StatusCode,
     content_type: &'static str,
@@ -634,39 +813,58 @@ fn static_response(
         .header(header::CONTENT_LENGTH, body.len().to_string())
         .body(full_body(body))
         .unwrap();
-    inject_persona_headers(persona, &mut resp, is_wordpress);
+    inject_headers_with_config(cfg, persona, &mut resp, is_wordpress);
     resp
 }
 
-pub fn inject_persona_headers<B>(
+pub fn inject_headers_with_config<B>(
+    cfg: &EvilpotConfig,
     persona: &PrebakedPersona,
     resp: &mut Response<B>,
     is_wordpress: bool,
 ) {
-    if let Ok(val) = HeaderValue::from_str(&persona.server_header) {
-        resp.headers_mut().insert(header::SERVER, val);
+    match cfg.server_header {
+        Some(ref custom_srv) => {
+            let trimmed = custom_srv.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = HeaderValue::from_str(trimmed) {
+                    resp.headers_mut().insert(header::SERVER, val);
+                }
+            }
+        }
+        None => {
+            if let Ok(val) = HeaderValue::from_str(&persona.server_header) {
+                resp.headers_mut().insert(header::SERVER, val);
+            }
+        }
     }
-    if let Ok(val) = HeaderValue::from_str(&persona.powered_by_header) {
-        resp.headers_mut()
-            .insert(HeaderName::from_static("x-powered-by"), val);
-    }
-    if let Ok(val) = HeaderValue::from_str(&persona.hostname) {
-        resp.headers_mut()
-            .insert(HeaderName::from_static("x-backend-node"), val);
-    }
-    if is_wordpress {
-        if let Ok(pingback) =
-            HeaderValue::from_str(&format!("http://{}.internal/xmlrpc.php", persona.hostname))
-        {
+
+    if cfg.emit_persona_headers {
+        if let Ok(val) = HeaderValue::from_str(&persona.powered_by_header) {
             resp.headers_mut()
-                .insert(HeaderName::from_static("x-pingback"), pingback);
+                .insert(HeaderName::from_static("x-powered-by"), val);
         }
-        if let Ok(link) = HeaderValue::from_str(&format!(
-            "<http://{}.internal/wp-json/>; rel=\"https://api.w.org/\"",
-            persona.hostname
-        )) {
-            resp.headers_mut().insert(header::LINK, link);
+        if let Ok(val) = HeaderValue::from_str(&persona.hostname) {
+            resp.headers_mut()
+                .insert(HeaderName::from_static("x-backend-node"), val);
         }
+        if is_wordpress {
+            if let Ok(pingback) =
+                HeaderValue::from_str(&format!("http://{}.internal/xmlrpc.php", persona.hostname))
+            {
+                resp.headers_mut()
+                    .insert(HeaderName::from_static("x-pingback"), pingback);
+            }
+            if let Ok(link) = HeaderValue::from_str(&format!(
+                "<http://{}.internal/wp-json/>; rel=\"https://api.w.org/\"",
+                persona.hostname
+            )) {
+                resp.headers_mut().insert(header::LINK, link);
+            }
+        }
+    }
+
+    if is_wordpress {
         if let Ok(cookie) = HeaderValue::from_str(&format!(
             "wordpress_test_cookie=WP%20Cookie%20check; path=/; wordpress_sec_{}={}; path=/wp-admin",
             &persona.wp_cookie_hash[..16],
@@ -677,6 +875,15 @@ pub fn inject_persona_headers<B>(
     }
 }
 
+pub fn inject_persona_headers<B>(
+    persona: &PrebakedPersona,
+    resp: &mut Response<B>,
+    is_wordpress: bool,
+) {
+    let default_cfg = EvilpotConfig::default();
+    inject_headers_with_config(&default_cfg, persona, resp, is_wordpress);
+}
+
 /// Zero-allocation slow-drip HTTP body stream for tarpitting scanners & data exfiltration tools.
 /// Automatically updates `EvilpotEngine::record_tarpit_progress` as the attacker reads frames,
 /// verifying active download tools once they exceed the byte or duration threshold!
@@ -685,6 +892,8 @@ pub struct TarpitDripBody {
     client_ip: IpAddr,
     persona: Arc<PrebakedPersona>,
     started_at: Instant,
+    header_prefix: Bytes,
+    header_cursor: usize,
     chunk: Bytes,
     cursor: usize,
     remaining_bytes: u64,
@@ -711,6 +920,8 @@ impl TarpitDripBody {
             client_ip,
             persona,
             started_at: Instant::now(),
+            header_prefix: Bytes::new(),
+            header_cursor: 0,
             chunk,
             cursor: 0,
             remaining_bytes: total_bytes,
@@ -720,6 +931,12 @@ impl TarpitDripBody {
             first_frame_sent: false,
             _permit: permit,
         }
+    }
+
+    pub fn with_header_prefix(mut self, prefix: Bytes) -> Self {
+        self.header_prefix = prefix;
+        self.header_cursor = 0;
+        self
     }
 }
 
@@ -751,22 +968,38 @@ impl HttpBody for TarpitDripBody {
             self.first_frame_sent = true;
         }
 
-        let to_send = (self.drip_bytes_per_tick as u64)
-            .min(self.remaining_bytes)
-            .min((self.chunk.len() - self.cursor) as u64) as usize;
+        let target = (self.drip_bytes_per_tick as u64).min(self.remaining_bytes) as usize;
+        let out_bytes = if self.header_cursor < self.header_prefix.len() {
+            let mut buf = Vec::with_capacity(target);
+            let hdr_avail = self.header_prefix.len() - self.header_cursor;
+            let take_hdr = hdr_avail.min(target);
+            buf.extend_from_slice(&self.header_prefix[self.header_cursor..self.header_cursor + take_hdr]);
+            self.header_cursor += take_hdr;
+            let rem = target - take_hdr;
+            if rem > 0 && !self.chunk.is_empty() {
+                let take_chunk = rem.min(self.chunk.len() - self.cursor);
+                buf.extend_from_slice(&self.chunk[self.cursor..self.cursor + take_chunk]);
+                self.cursor = (self.cursor + take_chunk) % self.chunk.len();
+            }
+            Bytes::from(buf)
+        } else {
+            let to_send = target.min(self.chunk.len() - self.cursor);
+            let slice = self.chunk.slice(self.cursor..self.cursor + to_send);
+            self.cursor = (self.cursor + to_send) % self.chunk.len();
+            slice
+        };
 
-        let slice = self.chunk.slice(self.cursor..self.cursor + to_send);
-        self.cursor = (self.cursor + to_send) % self.chunk.len();
-        self.remaining_bytes -= to_send as u64;
+        let sent = out_bytes.len() as u64;
+        self.remaining_bytes -= sent;
 
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
         self.engine.record_tarpit_progress(
             self.client_ip,
             &self.persona,
-            to_send as u64,
+            sent,
             elapsed_ms,
         );
 
-        Poll::Ready(Some(Ok(Frame::data(slice))))
+        Poll::Ready(Some(Ok(Frame::data(out_bytes))))
     }
 }

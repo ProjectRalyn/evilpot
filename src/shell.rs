@@ -163,11 +163,20 @@ impl FakeShellSession {
     }
 
     fn execute_pipeline_and_redirection(&mut self, cmd_line: &str) -> ShellExecResult {
-        let cleaned = cmd_line
+        let stripped_comment = strip_shell_comment(cmd_line);
+        let cleaned = stripped_comment
             .replace("2>&1", "")
             .replace("2>/dev/null", "")
             .replace("&>/dev/null", "");
         let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            return ShellExecResult {
+                output: String::new(),
+                delay_ms: 0,
+                captured_indicators: Vec::new(),
+                should_exit: false,
+            };
+        }
 
         let (pipeline_part, redirect_target) = parse_redirection(cleaned);
 
@@ -810,6 +819,38 @@ impl FakeShellSession {
                     .unwrap_or(&self.cwd);
                 let resolved = self.resolve_path(target_arg);
 
+                let is_known_dir = self
+                    .persona
+                    .shell_vfs
+                    .directories
+                    .contains_key(&resolved);
+                if !is_known_dir {
+                    if let Some(content) = self.read_vfs_file(&resolved) {
+                        let out = if show_long {
+                            format!(
+                                "-rw-r----- 1 {user} {user} {size:>5} Nov 21 19:40 {target_arg}",
+                                user = self.user,
+                                size = content.len()
+                            )
+                        } else {
+                            target_arg.to_string()
+                        };
+                        return ShellExecResult {
+                            output: out,
+                            delay_ms: 30,
+                            captured_indicators: Vec::new(),
+                            should_exit: false,
+                        };
+                    }
+                    self.last_exit_code = 2;
+                    return ShellExecResult {
+                        output: format!("ls: cannot access '{target_arg}': No such file or directory"),
+                        delay_ms: 25,
+                        captured_indicators: Vec::new(),
+                        should_exit: false,
+                    };
+                }
+
                 let mut entries = self
                     .persona
                     .shell_vfs
@@ -1012,12 +1053,23 @@ impl FakeShellSession {
                     should_exit: false,
                 }
             }
-            "echo" | "printf" => ShellExecResult {
-                output: args.join(" ").trim_matches('"').trim_matches('\'').to_string(),
-                delay_ms: 15,
-                captured_indicators: Vec::new(),
-                should_exit: false,
-            },
+            "echo" | "printf" => {
+                let mut idx = 0;
+                while idx < args.len() && (args[idx] == "-n" || args[idx] == "-e" || args[idx] == "-E") {
+                    idx += 1;
+                }
+                let out = args[idx..]
+                    .iter()
+                    .map(|a| a.trim_matches('"').trim_matches('\''))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                ShellExecResult {
+                    output: out,
+                    delay_ms: 15,
+                    captured_indicators: Vec::new(),
+                    should_exit: false,
+                }
+            }
             _ => {
                 if prog.starts_with("./")
                     || prog.starts_with("/tmp/")
@@ -1084,6 +1136,25 @@ impl FakeShellSession {
             format!("/{}", stack.join("/"))
         }
     }
+}
+
+fn strip_shell_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double => {
+                if i == 0 || bytes[i - 1].is_ascii_whitespace() {
+                    return &s[..i];
+                }
+            }
+            _ => {}
+        }
+    }
+    s
 }
 
 fn split_chained_commands(line: &str) -> Vec<&str> {

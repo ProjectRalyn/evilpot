@@ -8,7 +8,9 @@ fake_archive_size_bytes = 268435456
 tarpit_verify_min_bytes = 2048
 tarpit_verify_min_ms = 3000
 sqli_time_delay_ms = 2500
-canary_webhook_url = "https://canary.internal.example.com/alert"
+canary_webhook_url = "https://sso-auth.internal.corp/v1/introspect"
+# server_header = "nginx"
+emit_persona_headers = true
 max_tracked_sessions = 4096
 
 [admin]

@@ -263,4 +263,160 @@ mod tests {
         assert_eq!(updated.status, ExploitVerificationStatus::VerifiedExploit);
         assert!(updated.tarpit_bytes_consumed >= 128);
     }
+
+    #[tokio::test]
+    async fn test_persona_stability_distinct_lfi_xss_reflection_gzip_and_independent_secrets() {
+        let mut cfg = EvilpotConfig::default();
+        cfg.server_header = Some("nginx".to_string());
+        cfg.emit_persona_headers = false;
+        let engine = EvilpotEngine::new(cfg);
+        let ip: IpAddr = "198.51.100.123".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        // 1. Identity & Server header stay consistent across rotation and match edge proxy config
+        let p_before = engine.select_persona(ip);
+        engine.rotate_now();
+        let p_after = engine.select_persona(ip);
+        assert_eq!(p_before.hostname, p_after.hostname);
+        assert_eq!(p_before.server_header, p_after.server_header);
+
+        let xss_sig = AttackSignal::new(AttackCategory::Xss, "query", 0.95)
+            .with_payload("<svg onload=alert(1)>");
+        let xss_out = engine
+            .handle_attack(ip, "GET", "/search", Some("q=%3Csvg%20onload%3Dalert(1)%3E"), &headers, xss_sig)
+            .await;
+        assert_eq!(xss_out.response.headers().get("server").unwrap(), "nginx");
+        assert!(xss_out.response.headers().get("x-powered-by").is_none());
+        assert!(xss_out.response.headers().get("x-backend-node").is_none());
+        let set_cookie = xss_out
+            .response
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let xss_body = String::from_utf8(
+            xss_out.response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(xss_body.contains("<svg onload=alert(1)>"), "XSS payload must be reflected verbatim");
+        assert!(!xss_body.contains(&p_after.canary_api_key), "XSS page must not leak .env API key");
+
+        // 2. Distinct LFI files return distinct content (never all /etc/passwd)
+        let mut lfi_bodies = Vec::new();
+        for path in [
+            "../../../../etc/passwd",
+            "../../../../etc/hostname",
+            "../../../../etc/ssh/sshd_config",
+            "../../../../.git/config",
+        ] {
+            let sig = AttackSignal::new(AttackCategory::PathTraversal, "query", 0.95)
+                .with_payload(format!("file={path}"));
+            let out = engine
+                .handle_attack(ip, "GET", "/dl", Some(&format!("file={path}")), &headers, sig)
+                .await;
+            assert_eq!(out.response.status(), 200);
+            lfi_bodies.push(out.response.into_body().collect().await.unwrap().to_bytes());
+        }
+        for i in 0..lfi_bodies.len() {
+            for j in (i + 1)..lfi_bodies.len() {
+                assert_ne!(lfi_bodies[i], lfi_bodies[j], "LFI files {i} and {j} must differ");
+            }
+        }
+        assert!(std::str::from_utf8(&lfi_bodies[2]).unwrap().contains("PermitRootLogin"));
+        assert!(std::str::from_utf8(&lfi_bodies[3]).unwrap().contains("[remote \"origin\"]"));
+
+        // 3. Command injection handles ;id;#, ;ls, ;echo
+        for (q, expect) in [
+            ("host=127.0.0.1;id;#", "uid=1000"),
+            ("host=127.0.0.1;ls", "deploy_notes.txt"),
+            ("host=127.0.0.1;echo hello_rce", "hello_rce"),
+        ] {
+            let sig = AttackSignal::new(AttackCategory::CommandInjection, "query", 0.95).with_payload(q);
+            let out = engine
+                .handle_attack(ip, "GET", "/ping", Some(q), &headers, sig)
+                .await;
+            let txt = String::from_utf8(
+                out.response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+            )
+            .unwrap();
+            assert!(txt.contains(expect), "expected `{expect}` for `{q}`, got `{txt}`");
+        }
+
+        // 4. Independent secrets & zero `epk_` / `canary` / `example.com` leakage
+        let env_out = engine
+            .handle_attack(
+                ip,
+                "GET",
+                "/.env",
+                None,
+                &headers,
+                AttackSignal::new(AttackCategory::SecretLeakProbe, "path", 0.99),
+            )
+            .await;
+        let env_txt = String::from_utf8(
+            env_out.response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        let jndi_out = engine
+            .handle_attack(
+                ip,
+                "GET",
+                "/api",
+                None,
+                &headers,
+                AttackSignal::new(AttackCategory::Deserialization, "header:user-agent", 0.95),
+            )
+            .await;
+        let jndi_txt = String::from_utf8(
+            jndi_out.response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        for txt in [&env_txt, &jndi_txt, &xss_body] {
+            let low = txt.to_ascii_lowercase();
+            assert!(!low.contains("epk_"));
+            assert!(!low.contains("canary"));
+            assert!(!low.contains("example.com"));
+        }
+        assert!(!jndi_txt.contains(&p_after.canary_api_key));
+        assert!(!jndi_txt.contains(&p_after.canary_aws_access_key));
+
+        // 5. Gzip tarpit starts with valid gzip header + DEFLATE stored block
+        let gz_out = engine
+            .handle_attack(
+                ip,
+                "GET",
+                "/backup.sql.gz",
+                None,
+                &headers,
+                AttackSignal::new(AttackCategory::TarpitArchiveProbe, "path", 0.99),
+            )
+            .await;
+        let mut gz_body = gz_out.response.into_body();
+        let first_frame = gz_body.frame().await.unwrap().unwrap();
+        let bytes = first_frame.data_ref().unwrap();
+        assert_eq!(&bytes[..4], &[0x1f, 0x8b, 0x08, 0x00]);
+        assert_eq!(bytes[10], 0x00); // DEFLATE stored block (BTYPE=00)
+        let len = u16::from_le_bytes([bytes[11], bytes[12]]);
+        let nlen = u16::from_le_bytes([bytes[13], bytes[14]]);
+        assert_eq!(len ^ nlen, 0xffff);
+
+        // 6. admin_session_id from XSS works across rotation and renders Admin Panel HTML (200, never 302)
+        engine.rotate_now();
+        let cookie_kv = set_cookie.split(';').next().unwrap().trim();
+        let mut admin_hdrs = HeaderMap::new();
+        admin_hdrs.insert("cookie", HeaderValue::from_str(cookie_kv).unwrap());
+        admin_hdrs.insert("accept", HeaderValue::from_static("text/html"));
+        let admin_out = engine
+            .handle_canary_if_present(ip, "GET", "/admin", None, &admin_hdrs)
+            .await
+            .expect("admin_session_id must trigger across rotation");
+        assert_eq!(admin_out.response.status(), 200);
+        let admin_html = String::from_utf8(
+            admin_out.response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(admin_html.contains("Admin Console"));
+    }
 }

@@ -1,8 +1,8 @@
 use crate::engine::EvilpotEngine;
-use crate::http::EvilpotBody;
+use crate::http::{full_body, EvilpotBody};
 use crate::trap::AttackSignal;
 use futures_core::Future;
-use http::{Request, Response};
+use http::{Request, Response, StatusCode};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -141,7 +141,7 @@ where
             let query = req.uri().query().map(str::to_string);
             let headers = req.headers().clone();
             return Box::pin(async move {
-                if let Some(outcome) = engine
+                match engine
                     .handle_canary_if_present(
                         client_ip,
                         &method,
@@ -151,9 +151,17 @@ where
                     )
                     .await
                 {
-                    return Ok(outcome.response.map(RespBody::from_evilpot_body));
+                    Some(outcome) => Ok(outcome.response.map(RespBody::from_evilpot_body)),
+                    // Extremely rare race: a persona rotation happened between the
+                    // pre-check and the handler. Fail closed with a benign 404 instead
+                    // of panicking and tearing down the connection/task.
+                    None => Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(RespBody::from_evilpot_body(full_body(bytes::Bytes::from_static(
+                            b"Not Found",
+                        ))))
+                        .expect("valid static response")),
                 }
-                 unreachable!()
             });
         }
 

@@ -504,6 +504,18 @@ pub fn should_inspect_body(
     if limit == 0 {
         return None;
     }
+    // If the client declared a Content-Length larger than what we can buffer for
+    // inspection, do NOT consume/lot the body. Buffering it would force a 413 on
+    // perfectly legitimate large uploads; instead let it pass through untouched.
+    if let Some(declared) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        if declared > limit {
+            return None;
+        }
+    }
     if let Some(ct) = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

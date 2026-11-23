@@ -64,6 +64,11 @@ pub struct PrebakedPersona {
     pub canary_cookie_value: String,
     pub canary_endpoint_path: String,
     pub canary_url: String,
+    /// Per-trap distinct canary credentials `(kind, token)` so SQLi/XSS/.env/Log4j/SSRF/Git
+    /// never reuse the exact same secret across unrelated vulnerabilities.
+    pub extra_canary_tokens: Vec<(String, String)>,
+    /// Additional canary paths registered for this persona.
+    pub extra_canary_paths: Vec<String>,
 
     // Deep WordPress pre-baked HTTP bodies
     pub wp_version: String,
@@ -90,16 +95,23 @@ pub struct PrebakedPersona {
     pub openapi_json: Bytes,
     pub api_debug_json: Bytes,
     pub canary_vault_export_json: Bytes,
+    pub canary_admin_panel_html: Bytes,
     pub sqli_error_mysql_html: Bytes,
     pub sqli_error_postgres_html: Bytes,
     pub sqli_boolean_true_html: Bytes,
     pub sqli_boolean_false_html: Bytes,
+    pub tarpit_gzip_header: Bytes,
     pub tarpit_gzip_chunk: Bytes,
+    pub tarpit_hprof_header: Bytes,
     pub tarpit_hprof_chunk: Bytes,
 
     // Pre-baked payloads tailored for the 12 attack categories
     pub lfi_etc_passwd_body: Bytes,
     pub lfi_proc_environ_body: Bytes,
+    pub win_ini_body: Bytes,
+    pub boot_ini_body: Bytes,
+    pub web_xml_body: Bytes,
+    pub htaccess_body: Bytes,
     pub ssrf_aws_imds_json: Bytes,
     pub ssti_eval_html: Bytes,
     pub nosql_dump_json: Bytes,
@@ -151,11 +163,17 @@ impl PrebakedPersona {
         slot_id: usize,
         canary_webhook_url: &str,
     ) -> Self {
-        let combined_seed = master_seed
+        // Identity seed depends ONLY on (master_seed, slot_id) so hostname, internal IP,
+        // Server header, and admin username NEVER flip across rotation epochs.
+        let identity_seed = master_seed
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(epoch_id.wrapping_mul(0xBF58_476D_1CE4_E5B9))
             .wrapping_add((slot_id as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
-        let mut rng = StdRng::seed_from_u64(combined_seed);
+        let mut id_rng = StdRng::seed_from_u64(identity_seed);
+
+        // Secret seed depends on (master_seed, epoch_id, slot_id) so tokens rotate cleanly.
+        let secret_seed = identity_seed
+            .wrapping_add(epoch_id.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        let mut rng = StdRng::seed_from_u64(secret_seed);
 
         let host_prefixes = [
             "gpu-train-node",
@@ -167,58 +185,127 @@ impl PrebakedPersona {
             "erp-legacy-srv",
             "ci-artifact-hub",
         ];
-        let prefix = host_prefixes[rng.gen_range(0..host_prefixes.len())];
-        let node_num = rng.gen_range(1..=32);
+        let prefix = host_prefixes[id_rng.gen_range(0..host_prefixes.len())];
+        let node_num = id_rng.gen_range(1..=32);
         let hostname = format!("{prefix}-{node_num:02}");
-        let internal_ip = format!("10.240.{}.{}", rng.gen_range(10..200), rng.gen_range(10..250));
+        let internal_ip = format!(
+            "10.240.{}.{}",
+            id_rng.gen_range(10..200),
+            id_rng.gen_range(10..250)
+        );
 
         let server_headers = [
-            ("Apache/2.4.49 (Ubuntu)", "PHP/7.4.21"),
+            ("nginx/1.24.0 (Ubuntu)", "PHP/8.1.27"),
             ("nginx/1.18.0 (Ubuntu)", "PHP/8.0.12"),
-            ("openresty/1.19.9.1", "PHP/7.4.33"),
-            ("Apache/2.4.50 (Debian)", "PHP/7.3.31-1~deb10u1"),
-            ("nginx/1.20.1", "PHP/8.1.9"),
+            ("Apache/2.4.52 (Ubuntu)", "PHP/7.4.33"),
+            ("openresty/1.21.4.1", "PHP/8.1.19"),
+            ("nginx/1.22.1", "PHP/8.2.10"),
         ];
-        let (server_header, powered_by) = server_headers[rng.gen_range(0..server_headers.len())];
+        let (server_header, powered_by) = server_headers[id_rng.gen_range(0..server_headers.len())];
 
-        let aws_access_key = format!("AKIA{}", random_alnum(&mut rng, 16, true));
-        let aws_secret_key = random_alnum(&mut rng, 40, false);
-        let db_pass = format!("Pr0d_{}_{}!", random_alnum(&mut rng, 10, false), epoch_id % 997);
-        let redis_pass = format!("Rds_{}_{}#", random_alnum(&mut rng, 10, false), epoch_id % 509);
-        let jwt_secret = random_hex(&mut rng, 48);
-        let stripe_key = format!("sk_live_51{}", random_alnum(&mut rng, 28, false));
-        let wp_nonce = format!("epk_{}", random_hex(&mut rng, 16));
-        let wp_cookie_hash = random_hex(&mut rng, 32);
         let admin_user = [
             "svc_deploy",
             "admin_ops",
             "gpu_scheduler",
             "db_maint",
             "release_bot",
-        ][rng.gen_range(0..5)]
+        ][id_rng.gen_range(0..5)]
         .to_string();
+        let wp_version = ["5.9.8", "6.1.4", "6.2.2", "6.4.3"][id_rng.gen_range(0..4)].to_string();
+
+        // Independent per-surface credentials (never share the same key across unrelated vulnerabilities)
+        let aws_access_key = format!("AKIA{}", random_alnum(&mut rng, 16, true));
+        let aws_secret_key = random_alnum(&mut rng, 40, false);
+        let db_pass = format!("Pr0d_{}_{}!", random_alnum(&mut rng, 10, false), rng.gen_range(100..997));
+        let redis_pass = format!("Rds_{}_{}#", random_alnum(&mut rng, 10, false), rng.gen_range(100..509));
+        let jwt_secret = random_hex(&mut rng, 48);
+        let stripe_key = format!("sk_live_51{}", random_alnum(&mut rng, 28, false));
+        let env_api_token = format!("sk_env_{}", random_hex(&mut rng, 24));
+        let cookie_session_token = random_hex(&mut rng, 32);
+
+        // WordPress-specific credentials
+        let wp_nonce = format!("wpn_{}", random_hex(&mut rng, 16));
+        let wp_cookie_hash = random_hex(&mut rng, 32);
+        let wp_db_pass = format!("WpDb_{}_{}!", random_alnum(&mut rng, 9, false), rng.gen_range(100..997));
+        let wp_redis_pass = format!("WpRds_{}_{}#", random_alnum(&mut rng, 8, false), rng.gen_range(100..997));
+        let wp_aws_key = format!("AKIA{}", random_alnum(&mut rng, 16, true));
+        let wp_aws_secret = random_alnum(&mut rng, 40, false);
+        let wp_auth_key = random_hex(&mut rng, 48);
+        let wp_export_id = random_hex(&mut rng, 12);
+        let wp_export_path = format!("/api/v1/internal/wp-sync/{wp_export_id}");
+
+        // Git / Actuator / PHPInfo / API Debug credentials
+        let git_token = format!("glpat-{}", random_alnum(&mut rng, 20, false));
+        let git_deploy_token = format!("pat_git_{}", random_hex(&mut rng, 20));
+        let actuator_token = format!("act_tok_{}", random_hex(&mut rng, 20));
+        let actuator_aws_key = format!("AKIA{}", random_alnum(&mut rng, 16, true));
+        let actuator_aws_secret = random_alnum(&mut rng, 40, false);
+        let actuator_db_pass = format!("Spr_{}!", random_alnum(&mut rng, 10, false));
+        let php_db_pass = format!("Php_{}!", random_alnum(&mut rng, 10, false));
+        let php_aws_key = format!("AKIA{}", random_alnum(&mut rng, 16, true));
+        let php_token = format!("php_sess_{}", random_hex(&mut rng, 18));
+        let api_debug_token = format!("dbg_key_{}", random_hex(&mut rng, 20));
+
+        // Per-vulnerability independent tokens (SQLi, SSRF, SSTI, NoSQL, JNDI, LDAP, CRLF)
+        let sqli_api_secret = format!("db_tok_{}", random_hex(&mut rng, 18));
+        let ssrf_aws_key = format!("ASIA{}", random_alnum(&mut rng, 16, true));
+        let ssrf_aws_secret = random_alnum(&mut rng, 40, false);
+        let ssrf_sts_token = format!("IQoJb3JpZ2luX2Vj{}", random_alnum(&mut rng, 32, false));
+        let ssti_secret_key = format!("flk_{}", random_hex(&mut rng, 32));
+        let ssti_admin_token = format!("tpl_adm_{}", random_hex(&mut rng, 18));
+        let ssti_db_pass = format!("AppDb_{}!", random_alnum(&mut rng, 10, false));
+        let nosql_api_key = format!("mgo_key_{}", random_hex(&mut rng, 20));
+        let nosql_jwt_secret = random_hex(&mut rng, 48);
+        let jndi_service_token = format!("svc_rpc_{}", random_hex(&mut rng, 20));
+        let ldap_service_token = format!("ldap_svc_{}", random_hex(&mut rng, 18));
+        let crlf_gateway_token = format!("gw_auth_{}", random_hex(&mut rng, 20));
+
         let fake_bcrypt = format!(
             "$2y$10${}.{}",
             random_alnum(&mut rng, 22, false),
             random_alnum(&mut rng, 31, false)
         );
         let fake_wp_phpass = format!("$P$B{}", random_alnum(&mut rng, 30, false));
-        let db_secret_row = format!("{admin_user}:{fake_bcrypt}:role=superadmin:token={wp_nonce}");
+        let db_secret_row = format!("{admin_user}:{fake_bcrypt}:role=superadmin:token={sqli_api_secret}");
 
         let canary_token_id = random_hex(&mut rng, 16);
         let canary_endpoint_path = format!("/api/v1/internal/vault-export/{canary_token_id}");
         let canary_url = format!(
-            "{}/{}/epoch-{}/slot-{}",
+            "{}/{}",
             canary_webhook_url.trim_end_matches('/'),
             canary_token_id,
-            epoch_id,
-            slot_id
         );
+        let wp_callback_url = format!(
+            "{}/{}",
+            canary_webhook_url.trim_end_matches('/'),
+            wp_export_id,
+        );
+
+        let extra_canary_tokens = vec![
+            ("wp_api_token".to_string(), wp_nonce.clone()),
+            ("wp_aws_key".to_string(), wp_aws_key.clone()),
+            ("git_pat_token".to_string(), git_token.clone()),
+            ("git_deploy_token".to_string(), git_deploy_token.clone()),
+            ("actuator_token".to_string(), actuator_token.clone()),
+            ("actuator_aws_key".to_string(), actuator_aws_key.clone()),
+            ("php_aws_key".to_string(), php_aws_key.clone()),
+            ("php_token".to_string(), php_token.clone()),
+            ("api_debug_token".to_string(), api_debug_token.clone()),
+            ("sqli_api_secret".to_string(), sqli_api_secret.clone()),
+            ("ssrf_sts_key".to_string(), ssrf_aws_key.clone()),
+            ("ssrf_sts_token".to_string(), ssrf_sts_token.clone()),
+            ("ssti_secret_key".to_string(), ssti_secret_key.clone()),
+            ("ssti_admin_token".to_string(), ssti_admin_token.clone()),
+            ("nosql_api_key".to_string(), nosql_api_key.clone()),
+            ("jndi_service_token".to_string(), jndi_service_token.clone()),
+            ("ldap_service_token".to_string(), ldap_service_token.clone()),
+            ("crlf_gateway_token".to_string(), crlf_gateway_token.clone()),
+        ];
+        let extra_canary_paths = vec![wp_export_path.clone()];
 
         // ====================================================================
         // 1. Realistic WordPress Full Suite
         // ====================================================================
-        let wp_version = ["5.8.1", "5.9.3", "6.0.2", "6.1.1"][rng.gen_range(0..4)].to_string();
         let wp_login_html = Bytes::from(format!(
             r#"<!DOCTYPE html>
 <html lang="en-US">
@@ -231,7 +318,6 @@ impl PrebakedPersona {
 <link rel='stylesheet' id='buttons-css' href='/wp-includes/css/buttons.min.css?ver={wp_version}' media='all' />
 <link rel='stylesheet' id='login-css' href='/wp-admin/css/login.min.css?ver={wp_version}' media='all' />
 <link rel="https://api.w.org/" href="http://{hostname}.internal/wp-json/" />
-<!-- active-plugins: wp-file-manager/6.8, revslider/6.5.8, duplicator-pro/4.5.1, redis-cache/2.2.0 -->
 </head>
 <body class="login no-js login-action-login wp-core-ui locale-en-us">
 <div id="login">
@@ -314,7 +400,7 @@ impl PrebakedPersona {
     "/": {{"namespace": "", "methods": ["GET"]}},
     "/wp/v2/users": {{"namespace": "wp/v2", "methods": ["GET", "POST"]}},
     "/wp/v2/posts": {{"namespace": "wp/v2", "methods": ["GET", "POST"]}},
-    "{canary_endpoint_path}": {{"namespace": "wp-site-health/v1", "methods": ["GET", "POST"]}}
+    "{wp_export_path}": {{"namespace": "wp-site-health/v1", "methods": ["GET", "POST"]}}
   }}
 }}
 "#
@@ -326,18 +412,18 @@ impl PrebakedPersona {
     "id": 1,
     "name": "{admin_user}",
     "url": "http://{hostname}.internal",
-    "description": "Cluster SuperAdmin (SSH & DB Vault Sync Account - MFA temporarily disabled for migration)",
+    "description": "Cluster SuperAdmin",
     "link": "http://{hostname}.internal/author/{admin_user}/",
     "slug": "{admin_user}",
     "roles": ["administrator"],
     "avatar_urls": {{"24": "https://secure.gravatar.com/avatar/{}?s=24&d=mm&r=g", "96": "https://secure.gravatar.com/avatar/{}?s=96&d=mm&r=g"}},
-    "meta": {{"persisted_preferences": [], "legacy_api_token": "{wp_nonce}", "vault_export_path": "{canary_endpoint_path}", "sso_verify_endpoint": "{canary_url}"}}
+    "meta": {{"persisted_preferences": [], "legacy_api_token": "{wp_nonce}", "sync_endpoint": "{wp_export_path}", "sso_verify_endpoint": "{wp_callback_url}"}}
   }},
   {{
     "id": 2,
     "name": "wp_backup_cron",
     "url": "",
-    "description": "Nightly mysqldump & pg_dump automation worker",
+    "description": "Nightly mysqldump automation worker",
     "link": "http://{hostname}.internal/author/wp_backup_cron/",
     "slug": "wp_backup_cron",
     "roles": ["editor"],
@@ -358,7 +444,7 @@ impl PrebakedPersona {
     "status": "publish",
     "type": "post",
     "title": {{"rendered": "[INTERNAL] Q4 PostgreSQL &amp; Redis Cluster Failover Runbook ({hostname})"}},
-    "content": {{"rendered": "<p>During maintenance window, export vault secrets via <code>{canary_endpoint_path}</code> with header <code>X-Api-Key: {wp_nonce}</code>. Emergency token validation webhook: <a href=\"{canary_url}\">{canary_url}</a></p>", "protected": false}},
+    "content": {{"rendered": "<p>During maintenance window, sync settings via <code>{wp_export_path}</code> with header <code>X-Api-Key: {wp_nonce}</code>. Token introspection endpoint: <a href=\"{wp_callback_url}\">{wp_callback_url}</a></p>", "protected": false}},
     "author": 1
   }}
 ]
@@ -372,7 +458,7 @@ impl PrebakedPersona {
     <value>
       <struct>
         <member><name>faultCode</name><value><int>403</int></value></member>
-        <member><name>faultString</name><value><string>Incorrect username or password. (user='{admin_user}', hash_prefix='{fake_wp_phpass:.12}', debug_token='{wp_nonce}', backend='{hostname}')</string></value></member>
+        <member><name>faultString</name><value><string>Incorrect username or password. (user='{admin_user}', hash_prefix='{fake_wp_phpass:.12}', nonce='{wp_nonce}', backend='{hostname}')</string></value></member>
       </struct>
     </value>
   </fault>
@@ -411,24 +497,24 @@ impl PrebakedPersona {
  */
 define( 'DB_NAME', 'wp_prod_enterprise' );
 define( 'DB_USER', '{admin_user}' );
-define( 'DB_PASSWORD', '{db_pass}' );
+define( 'DB_PASSWORD', '{wp_db_pass}' );
 define( 'DB_HOST', '{internal_ip}:3306' );
 define( 'DB_CHARSET', 'utf8mb4' );
 
 /** Redis Object Cache & PostgreSQL Analytics Bridge */
 define( 'WP_REDIS_HOST', '{internal_ip}' );
 define( 'WP_REDIS_PORT', 6379 );
-define( 'WP_REDIS_PASSWORD', '{redis_pass}' );
-define( 'PG_ANALYTICS_DSN', 'pgsql:host={internal_ip};port=5432;dbname=prod_core_ledger;user={admin_user};password={db_pass}' );
+define( 'WP_REDIS_PASSWORD', '{wp_redis_pass}' );
+define( 'PG_ANALYTICS_DSN', 'pgsql:host={internal_ip};port=5432;dbname=wp_analytics;user={admin_user};password={wp_db_pass}' );
 
 /** Authentication Unique Keys and Salts. */
-define( 'AUTH_KEY',         '{jwt_secret}' );
-define( 'SECURE_AUTH_KEY',  '{aws_secret_key}' );
-define( 'AWS_S3_UPLOADS_KEY', '{aws_access_key}' );
-define( 'AWS_S3_UPLOADS_SECRET', '{aws_secret_key}' );
+define( 'AUTH_KEY',         '{wp_auth_key}' );
+define( 'SECURE_AUTH_KEY',  '{wp_aws_secret}' );
+define( 'AWS_S3_UPLOADS_KEY', '{wp_aws_key}' );
+define( 'AWS_S3_UPLOADS_SECRET', '{wp_aws_secret}' );
 define( 'INTERNAL_API_BYPASS_TOKEN', '{wp_nonce}' );
-define( 'INTERNAL_VAULT_EXPORT_PATH', '{canary_endpoint_path}' );
-define( 'INTERNAL_CANARY_PING', '{canary_url}' );
+define( 'INTERNAL_SYNC_PATH', '{wp_export_path}' );
+define( 'SSO_INTROSPECT_URL', '{wp_callback_url}' );
 
 $table_prefix = 'wp_prod_';
 define( 'WP_DEBUG', true );
@@ -438,14 +524,14 @@ define( 'WP_DEBUG_LOG', true );
 
         let wp_debug_log = Bytes::from(format!(
             r#"[22-Nov-2026 03:14:09 UTC] PHP Notice:  Undefined index: HTTP_X_FORWARDED_HOST in /var/www/html/wp-config.php on line 92
-[22-Nov-2026 03:18:44 UTC] WordPress database error Deadlock found when trying to get lock for query UPDATE wp_prod_options SET option_value = '{aws_access_key}:{aws_secret_key}' WHERE option_name = 's3_backup_credentials' made by do_action_ref_array('wp_nightly_s3_sync')
-[22-Nov-2026 04:02:11 UTC] PHP Warning:  Vault Export API triggered on {canary_endpoint_path} with X-Api-Key: {wp_nonce}
-[22-Nov-2026 04:15:00 UTC] SSO Webhook Retry queued: curl -X POST -H "Authorization: Bearer {jwt_secret}" {canary_url}
+[22-Nov-2026 03:18:44 UTC] WordPress database error Deadlock found when trying to get lock for query UPDATE wp_prod_options SET option_value = '{wp_aws_key}:{wp_aws_secret}' WHERE option_name = 's3_backup_credentials' made by do_action_ref_array('wp_nightly_s3_sync')
+[22-Nov-2026 04:02:11 UTC] PHP Warning:  Sync API triggered on {wp_export_path} with X-Api-Key: {wp_nonce}
+[22-Nov-2026 04:15:00 UTC] SSO Webhook Retry queued: curl -X POST -H "Authorization: Bearer {wp_auth_key}" {wp_callback_url}
 "#
         ));
 
         let wp_admin_ajax_json = Bytes::from(format!(
-            r#"{{"success":false,"data":{{"message":"Invalid security nonce for action. Expected nonce '{wp_nonce}' on node '{hostname}'","debug_user":"{admin_user}","vault_export":"{canary_endpoint_path}","plugin":"wp-file-manager-pro-6.8"}}}}"#
+            r#"{{"success":false,"data":{{"message":"Invalid security nonce for action. Expected nonce '{wp_nonce}' on node '{hostname}'","debug_user":"{admin_user}","sync_path":"{wp_export_path}","plugin":"wp-file-manager-pro-6.8"}}}}"#
         ));
 
         let wp_readme_html = Bytes::from(format!(
@@ -483,7 +569,7 @@ AWS_DEFAULT_REGION=us-east-1
 AWS_BUCKET={hostname}-db-backups-private
 
 JWT_SECRET={jwt_secret}
-ADMIN_BYPASS_TOKEN={wp_nonce}
+ADMIN_BYPASS_TOKEN={env_api_token}
 INTERNAL_VAULT_EXPORT_ENDPOINT={canary_endpoint_path}
 STRIPE_SECRET_KEY={stripe_key}
 INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
@@ -491,7 +577,6 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
             random_alnum(&mut rng, 44, false)
         ));
 
-        let git_token = random_alnum(&mut rng, 24, false);
         let git_config_body = Bytes::from(format!(
             r#"[core]
 	repositoryformatversion = 0
@@ -499,14 +584,14 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
 	bare = false
 	logallrefupdates = true
 [remote "origin"]
-	url = https://oauth2:glpat-{git_token}@git.internal.corp/{hostname}/monorepo.git
+	url = https://oauth2:{git_token}@git.internal.corp/{hostname}/monorepo.git
 	fetch = +refs/heads/*:refs/remotes/origin/*
 [branch "release/prod-hotfix"]
 	remote = origin
 	merge = refs/heads/release/prod-hotfix
 [deploy]
-	vaultExportPath = {canary_endpoint_path}
-	apiToken = {wp_nonce}
+	registry = registry.internal.corp/{hostname}
+	apiToken = {git_deploy_token}
 "#
         ));
         let git_head_body = Bytes::from("ref: refs/heads/release/prod-hotfix\n");
@@ -519,14 +604,13 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
       "name": "systemEnvironment",
       "properties": {{
         "HOSTNAME": {{"value": "{hostname}"}},
-        "SPRING_DATASOURCE_URL": {{"value": "jdbc:postgresql://{internal_ip}:5432/prod_core_ledger?user={admin_user}&password={db_pass}"}},
+        "SPRING_DATASOURCE_URL": {{"value": "jdbc:postgresql://{internal_ip}:5432/ops_gateway?user={admin_user}&password={actuator_db_pass}"}},
         "SPRING_REDIS_PASSWORD": {{"value": "{redis_pass}"}},
-        "AWS_ACCESS_KEY_ID": {{"value": "{aws_access_key}"}},
-        "AWS_SECRET_ACCESS_KEY": {{"value": "{aws_secret_key}"}},
-        "INTERNAL_ADMIN_API_TOKEN": {{"value": "{wp_nonce}"}},
-        "INTERNAL_VAULT_EXPORT_URI": {{"value": "{canary_endpoint_path}"}},
+        "AWS_ACCESS_KEY_ID": {{"value": "{actuator_aws_key}"}},
+        "AWS_SECRET_ACCESS_KEY": {{"value": "{actuator_aws_secret}"}},
+        "INTERNAL_ADMIN_API_TOKEN": {{"value": "{actuator_token}"}},
         "MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE": {{"value": "env,heapdump,threaddump,mappings"}},
-        "INTERNAL_CANARY_CALLBACK": {{"value": "{canary_url}"}}
+        "INTERNAL_AUTH_CALLBACK_URL": {{"value": "{canary_url}"}}
       }}
     }}
   ]
@@ -536,17 +620,13 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
 
         let phpinfo_html = Bytes::from(format!(
             r#"<!DOCTYPE html><html><head><title>phpinfo() - {hostname}</title></head>
-<body><h1>PHP Version 7.4.21</h1>
+<body><h1>PHP Version 8.1.27</h1>
 <table>
 <tr><td>System</td><td>Linux {hostname} 5.15.0-91-generic #101-Ubuntu SMP x86_64</td></tr>
-<tr><td>Loaded Configuration File</td><td>/etc/php/7.4/fpm/php.ini</td></tr>
-<tr><td>$_ENV['DB_PASSWORD']</td><td>{db_pass}</td></tr>
-<tr><td>$_ENV['REDIS_PASSWORD']</td><td>{redis_pass}</td></tr>
-<tr><td>$_ENV['AWS_ACCESS_KEY_ID']</td><td>{aws_access_key}</td></tr>
-<tr><td>$_ENV['AWS_SECRET_ACCESS_KEY']</td><td>{aws_secret_key}</td></tr>
-<tr><td>$_ENV['ADMIN_BYPASS_TOKEN']</td><td>{wp_nonce}</td></tr>
-<tr><td>$_ENV['VAULT_EXPORT_URI']</td><td>{canary_endpoint_path}</td></tr>
-<tr><td>$_ENV['SSO_TOKEN_VERIFY_URL']</td><td>{canary_url}</td></tr>
+<tr><td>Loaded Configuration File</td><td>/etc/php/8.1/fpm/php.ini</td></tr>
+<tr><td>$_ENV['DB_PASSWORD']</td><td>{php_db_pass}</td></tr>
+<tr><td>$_ENV['AWS_ACCESS_KEY_ID']</td><td>{php_aws_key}</td></tr>
+<tr><td>$_ENV['SERVICE_API_TOKEN']</td><td>{php_token}</td></tr>
 </table></body></html>
 "#
         ));
@@ -564,15 +644,15 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
           "fields": [
             {{
               "name": "internalAdminUsers",
-              "description": "DEPRECATED: Requires header Authorization: Bearer {wp_nonce} or endpoint {canary_endpoint_path}",
+              "description": "DEPRECATED: Requires header Authorization: Bearer {api_debug_token}",
               "args": [{{"name": "rawWhereClause", "type": {{"name": "String"}}}}],
               "type": {{"name": "UserList"}}
             }},
             {{
-              "name": "exportVaultCredentials",
-              "description": "Cluster node {hostname} emergency key export",
+              "name": "exportServiceMetrics",
+              "description": "Cluster node {hostname} internal diagnostics",
               "args": [],
-              "type": {{"name": "VaultExport"}}
+              "type": {{"name": "DiagnosticsExport"}}
             }}
           ]
         }}
@@ -589,12 +669,12 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
   "info": {{
     "title": "{hostname} Internal Control Plane API",
     "version": "1.4.2-debug",
-    "description": "Staging/Production shared gateway. Temporary debug token: {wp_nonce}"
+    "description": "Staging/Production shared gateway. Service token: {api_debug_token}"
   }},
   "paths": {{
     "{canary_endpoint_path}": {{
       "get": {{
-        "summary": "Export unencrypted cluster vault credentials (requires X-Api-Key: {wp_nonce})"
+        "summary": "Export cluster configuration bundle (requires X-Api-Key)"
       }}
     }},
     "/api/v1/admin/users": {{
@@ -604,7 +684,7 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
       }}
     }},
     "/actuator/heapdump": {{
-      "get": {{"summary": "Download full JVM memory heapdump (contains live session keys)"}}
+      "get": {{"summary": "Download JVM memory heapdump"}}
     }}
   }}
 }}
@@ -615,10 +695,10 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
             r#"{{
   "status": "degraded_debug_mode",
   "node": "{hostname}",
-  "epoch": {epoch_id},
-  "auth_bypass_hint": "Pass header Authorization: Bearer {wp_nonce} or GET {canary_endpoint_path}",
+  "build_rev": "{wp_version}-rc2",
+  "auth_bypass_hint": "Pass header Authorization: Bearer {api_debug_token}",
   "cached_sessions": [
-    {{"user": "{admin_user}", "role": "root", "api_token": "{wp_nonce}", "vault_export_path": "{canary_endpoint_path}", "verification_endpoint": "{canary_url}"}}
+    {{"user": "{admin_user}", "role": "root", "api_token": "{api_debug_token}", "sso_endpoint": "{canary_url}"}}
   ]
 }}
 "#
@@ -628,7 +708,6 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
             r#"{{
   "status": "vault_export_unlocked",
   "node": "{hostname}",
-  "epoch": {epoch_id},
   "exported_by": "{admin_user}",
   "credentials": {{
     "aws_access_key_id": "{aws_access_key}",
@@ -641,57 +720,122 @@ INTERNAL_SSO_VALIDATION_WEBHOOK={canary_url}
 "#
         ));
 
-        let table_suffix = epoch_id % 1000;
+        let canary_admin_panel_html = Bytes::from(format!(
+            r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Internal Operations Portal</title>
+<style>body{{font-family:system-ui,sans-serif;margin:2rem;color:#1e293b}}table{{border-collapse:collapse;width:100%;max-width:720px}}td,th{{border:1px solid #cbd5e1;padding:8px;text-align:left}}</style>
+</head>
+<body>
+<h1>Admin Console ({hostname})</h1>
+<p>Signed in as <strong>{admin_user}</strong> (role: <code>superadmin</code>)</p>
+<ul>
+  <li><a href="{canary_endpoint_path}">Export Cluster Credentials JSON</a></li>
+  <li><a href="/backup.sql.gz">Download Nightly PostgreSQL Snapshot (.sql.gz)</a></li>
+  <li>API Token: <code>{env_api_token}</code></li>
+</ul>
+<table>
+  <tr><th>Service</th><th>Endpoint</th><th>Status</th></tr>
+  <tr><td>Core Ledger DB</td><td>{internal_ip}:5432</td><td>healthy</td></tr>
+  <tr><td>Redis Session Store</td><td>{internal_ip}:6379</td><td>healthy</td></tr>
+</table>
+</body>
+</html>
+"#
+        ));
+
+        let table_suffix = rng.gen_range(10..999);
         let sqli_error_mysql_html = Bytes::from(format!(
             r#"<!DOCTYPE html><html><body>
-<b>Fatal error</b>: Uncaught mysqli_sql_exception: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' at line 1 (Query: <code>SELECT id, username, password_hash, api_secret FROM prod_ledger.users_v{table_suffix} WHERE tenant='{hostname}' AND api_token='{wp_nonce}' AND id = ...</code>) in <b>/var/www/{hostname}/includes/db.php</b> on line <b>142</b>
-<!-- Debug endpoint: {canary_endpoint_path} -->
+<b>Fatal error</b>: Uncaught mysqli_sql_exception: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ''' at line 1 in <b>/var/www/app/includes/db.php</b> on line <b>142</b>
 </body></html>
 "#
         ));
 
         let sqli_error_postgres_html = Bytes::from(format!(
             r#"ERROR:  syntax error at or near "'"
-LINE 1: SELECT account_id, secret_key FROM vault_keys_{table_suffix} WHERE ...
-                                                                      ^
-HINT:  Node {hostname} PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1) - fallback debug path: {canary_endpoint_path} (token: {wp_nonce})
+LINE 1: SELECT id, username, role FROM app_accounts_v{table_suffix} WHERE client_id = ''
+                                                                                      ^
+HINT:  PostgreSQL 14.9 on x86_64-pc-linux-gnu
 "#
         ));
 
         let sqli_boolean_true_html = Bytes::from(format!(
-            r#"<!DOCTYPE html><html><head><title>{hostname} Directory</title></head>
+            r#"<!DOCTYPE html><html><head><title>Account Directory</title></head>
 <body>
 <div class="record-status" data-code="FOUND">
   <h2>Account Record #1 ({admin_user})</h2>
-  <p>Department: Core Infrastructure / GPU Cluster Management</p>
-  <p>Status: Active (Key ID: {wp_nonce}, Vault URI: {canary_endpoint_path})</p>
+  <p>Department: Core Infrastructure</p>
+  <p>Status: Active (Ref: {sqli_api_secret})</p>
 </div>
 </body></html>
 "#
         ));
 
         let sqli_boolean_false_html = Bytes::from(format!(
-            r#"<!DOCTYPE html><html><head><title>{hostname} Directory</title></head>
+            r#"<!DOCTYPE html><html><head><title>Account Directory</title></head>
 <body>
 <div class="record-status" data-code="EMPTY">
   <h2>No matching account record found</h2>
-  <p>0 rows returned from prod_ledger.users_v{table_suffix}</p>
+  <p>0 rows returned from app_accounts_v{table_suffix}</p>
 </div>
 </body></html>
 "#
         ));
 
-        let mut gzip_buf = Vec::with_capacity(4096);
-        gzip_buf.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
-        while gzip_buf.len() < 4096 {
-            gzip_buf.push(rng.gen());
+        // Build a 100% valid streaming gzip payload:
+        // - 10-byte gzip header emitted once in TarpitDripBody
+        // - Repeating 4096-byte valid DEFLATE stored block (BTYPE=00, 5-byte header + 4091-byte SQL dump)
+        let tarpit_gzip_header = Bytes::from_static(&[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        ]);
+        let sql_header = format!(
+            "-- PostgreSQL database dump\n\
+             -- Dumped from database version 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1)\n\
+             SET statement_timeout = 0;\n\
+             SET client_encoding = 'UTF8';\n\
+             CREATE TABLE IF NOT EXISTS public.audit_events (id bigint NOT NULL, actor text, payload text, created_at timestamptz);\n"
+        );
+        let mut sql_raw = sql_header.into_bytes();
+        let mut row_id = 10001u64;
+        while sql_raw.len() < 4091 {
+            let line = format!(
+                "INSERT INTO public.audit_events VALUES ({row_id}, '{admin_user}', 'auth_token_sync:{}', '2026-11-22T03:14:09Z');\n",
+                random_hex(&mut rng, 24)
+            );
+            sql_raw.extend_from_slice(line.as_bytes());
+            row_id += 1;
         }
-        let tarpit_gzip_chunk = Bytes::from(gzip_buf);
+        sql_raw.truncate(4091);
+        let block_len: u16 = sql_raw.len() as u16; // 4091
+        let block_nlen: u16 = !block_len;
+        let mut gzip_block = Vec::with_capacity(5 + sql_raw.len());
+        gzip_block.push(0x00); // BFINAL=0, BTYPE=00 (stored block)
+        gzip_block.extend_from_slice(&block_len.to_le_bytes());
+        gzip_block.extend_from_slice(&block_nlen.to_le_bytes());
+        gzip_block.extend_from_slice(&sql_raw);
+        let tarpit_gzip_chunk = Bytes::from(gzip_block);
+
+        // Valid HPROF 1.0.2 header + repeating STRING_IN_UTF8 records
+        let mut hprof_hdr = Vec::with_capacity(31);
+        hprof_hdr.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
+        hprof_hdr.extend_from_slice(&4u32.to_be_bytes()); // id_size = 4
+        hprof_hdr.extend_from_slice(&1795317249000u64.to_be_bytes()); // timestamp ms
+        let tarpit_hprof_header = Bytes::from(hprof_hdr);
 
         let mut hprof_buf = Vec::with_capacity(4096);
-        hprof_buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        while hprof_buf.len() < 4096 {
-            hprof_buf.push(rng.gen());
+        let mut str_id = 1u32;
+        while hprof_buf.len() + 64 <= 4096 {
+            let sym = format!("com/corp/gateway/session/TokenEntry_{}_{str_id}", random_hex(&mut rng, 12));
+            let rec_len = (4 + sym.len()) as u32;
+            hprof_buf.push(0x01); // HPROF_UTF8
+            hprof_buf.extend_from_slice(&0u32.to_be_bytes()); // time_offset
+            hprof_buf.extend_from_slice(&rec_len.to_be_bytes());
+            hprof_buf.extend_from_slice(&str_id.to_be_bytes());
+            hprof_buf.extend_from_slice(sym.as_bytes());
+            str_id += 1;
         }
         let tarpit_hprof_chunk = Bytes::from(hprof_buf);
 
@@ -707,10 +851,13 @@ HINT:  Node {hostname} PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1) - fallback
             &db_pass,
             &redis_pass,
             &jwt_secret,
-            &wp_nonce,
+            &env_api_token,
             &canary_endpoint_path,
             &canary_url,
             &fake_bcrypt,
+            &git_token,
+            &git_deploy_token,
+            &mut rng,
         );
 
         // ====================================================================
@@ -724,28 +871,49 @@ HINT:  Node {hostname} PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1) - fallback
                 .unwrap_or_default(),
         );
         let lfi_proc_environ_body = Bytes::from(format!(
-            "HOSTNAME={hostname}\0USER={admin_user}\0AWS_ACCESS_KEY_ID={aws_access_key}\0AWS_SECRET_ACCESS_KEY={aws_secret_key}\0PG_PASSWORD={db_pass}\0REDIS_PASSWORD={redis_pass}\0ADMIN_BYPASS_TOKEN={wp_nonce}\0VAULT_EXPORT_URI={canary_endpoint_path}\0SSO_VERIFY_WEBHOOK={canary_url}\0"
+            "HOSTNAME={hostname}\0USER={admin_user}\0AWS_ACCESS_KEY_ID={aws_access_key}\0AWS_SECRET_ACCESS_KEY={aws_secret_key}\0PG_PASSWORD={db_pass}\0REDIS_PASSWORD={redis_pass}\0ADMIN_BYPASS_TOKEN={env_api_token}\0VAULT_EXPORT_URI={canary_endpoint_path}\0SSO_VERIFY_WEBHOOK={canary_url}\0"
         ));
+        let win_ini_body = Bytes::from_static(
+            b"; for 16-bit app support\r\n[fonts]\r\n[extensions]\r\n[mci extensions]\r\n[files]\r\n[Mail]\r\nMAPI=1\r\n",
+        );
+        let boot_ini_body = Bytes::from_static(
+            b"[boot loader]\r\ntimeout=30\r\ndefault=multi(0)disk(0)rdisk(0)partition(1)\\WINDOWS\r\n[operating systems]\r\nmulti(0)disk(0)rdisk(0)partition(1)\\WINDOWS=\"Windows Server\" /noexecute=optout /fastdetect\r\n",
+        );
+        let web_xml_body = Bytes::from(format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee" version="4.0">
+  <display-name>{hostname}-gateway</display-name>
+  <context-param>
+    <param-name>spring.profiles.active</param-name>
+    <param-value>production</param-value>
+  </context-param>
+</web-app>
+"#
+        ));
+        let htaccess_body = Bytes::from_static(
+            b"RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteRule ^ index.php [QSA,L]\nOptions -Indexes\n",
+        );
+
         let ssrf_aws_imds_json = Bytes::from(format!(
             r#"{{
   "Code" : "Success",
   "LastUpdated" : "2026-11-22T03:00:00Z",
   "Type" : "AWS-HMAC",
-  "AccessKeyId" : "{aws_access_key}",
-  "SecretAccessKey" : "{aws_secret_key}",
-  "Token" : "{wp_nonce}",
-  "Expiration" : "2026-11-23T03:00:00Z",
-  "InstanceMetadataNode" : "{hostname}",
-  "VaultExportEndpoint" : "{canary_endpoint_path}",
-  "IamValidationCallback" : "{canary_url}"
+  "AccessKeyId" : "{ssrf_aws_key}",
+  "SecretAccessKey" : "{ssrf_aws_secret}",
+  "Token" : "{ssrf_sts_token}",
+  "Expiration" : "2026-11-23T09:00:00Z",
+  "InstanceId" : "i-0{}",
+  "Region" : "us-east-1"
 }}
-"#
+"#,
+            random_hex(&mut rng, 15)
         ));
         let ssti_eval_html = Bytes::from(format!(
-            r#"<!DOCTYPE html><html><head><title>{hostname} Template Debug</title></head>
+            r#"<!DOCTYPE html><html><head><title>Template Render</title></head>
 <body>
 <div class="rendered-expr">Result: 49</div>
-<pre class="jinja-debug-context">{{'ENV': 'production', 'SECRET_KEY': '{jwt_secret}', 'ADMIN_API_TOKEN': '{wp_nonce}', 'VAULT_EXPORT_URI': '{canary_endpoint_path}', 'SQLALCHEMY_DATABASE_URI': 'postgresql://{admin_user}:{db_pass}@{internal_ip}:5432/prod_core_ledger', 'AWS_ACCESS_KEY_ID': '{aws_access_key}', 'CANARY_PING': '{canary_url}'}}</pre>
+<pre class="jinja-debug-context">{{'ENV': 'production', 'SECRET_KEY': '{ssti_secret_key}', 'ADMIN_API_TOKEN': '{ssti_admin_token}', 'SQLALCHEMY_DATABASE_URI': 'postgresql://{admin_user}:{ssti_db_pass}@{internal_ip}:5432/portal_app'}}</pre>
 </body></html>
 "#
         ));
@@ -756,11 +924,8 @@ HINT:  Node {hostname} PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1) - fallback
     "username": "{admin_user}",
     "role": "superadmin",
     "passwordHash": "{fake_bcrypt}",
-    "apiKey": "{wp_nonce}",
-    "jwtSecret": "{jwt_secret}",
-    "vaultExportPath": "{canary_endpoint_path}",
-    "aws": {{"accessKeyId": "{aws_access_key}", "secretAccessKey": "{aws_secret_key}"}},
-    "webhook": "{canary_url}"
+    "apiKey": "{nosql_api_key}",
+    "jwtSecret": "{nosql_jwt_secret}"
   }}
 ]
 "#
@@ -769,11 +934,8 @@ HINT:  Node {hostname} PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1) - fallback
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <EntityLookupResponse node="{hostname}">
+    <EntityLookupResponse>
       <ResolvedEntity><![CDATA[{}]]></ResolvedEntity>
-      <AdminBypassToken>{wp_nonce}</AdminBypassToken>
-      <VaultExportPath>{canary_endpoint_path}</VaultExportPath>
-      <AuditWebhook>{canary_url}</AuditWebhook>
     </EntityLookupResponse>
   </soap:Body>
 </soap:Envelope>
@@ -785,11 +947,11 @@ HINT:  Node {hostname} PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1) - fallback
                 .unwrap_or("")
         ));
         let deser_jndi_trace_html = Bytes::from(format!(
-            r#"HTTP/1.1 500 Internal Server Error - {hostname}
+            r#"HTTP/1.1 500 Internal Server Error
 org.apache.logging.log4j.core.lookup.JndiLookup: InitialContext.lookup() resolved external reference with partial bind timeout
     at javax.naming.InitialContext.lookup(InitialContext.java:417)
     at com.corp.gateway.LegacyDeserializer.readObject(LegacyDeserializer.java:184)
-Caused by: javax.naming.CommunicationException: Connection reset while fetching remote class (node={hostname}, env_aws_key={aws_access_key}, admin_token={wp_nonce}, vault_uri={canary_endpoint_path}, canary={canary_url})
+Caused by: javax.naming.CommunicationException: Connection reset while fetching remote class (rpc_token={jndi_service_token}, directory_endpoint={canary_url})
 "#
         ));
         let ldap_dump_ldif = Bytes::from(format!(
@@ -798,26 +960,26 @@ objectClass: inetOrgPerson
 cn: Cluster SuperAdmin ({hostname})
 uid: {admin_user}
 userPassword:: e1NTSEF9{wp_cookie_hash}
-apiToken: {wp_nonce}
-vaultExportUri: {canary_endpoint_path}
-description: Temporary LDAP bypass enabled; verify token at {canary_url}
+serviceToken: {ldap_service_token}
 "#
         ));
         let xss_bait_html = Bytes::from(format!(
-            r#"<!DOCTYPE html><html><head><title>{hostname} Legacy Admin Search</title></head>
+            r#"<!DOCTYPE html><html><head><title>Portal Search</title></head>
 <body>
-<h1>Admin Portal Search ({hostname})</h1>
-<!-- legacy-auth-cookie: non-HttpOnly session active -->
-<div id="search-echo">Query received by legacy renderer (admin_user={admin_user}, api_token={wp_nonce}, vault_export={canary_endpoint_path})</div>
+<h1>Search Results</h1>
+<form method="GET" action="/search">
+  <input type="text" name="q" value="" />
+  <button type="submit">Search</button>
+</form>
+<div id="search-echo">No matching records found.</div>
 </body></html>
 "#
         ));
         let crlf_proxy_debug_html = Bytes::from(format!(
-            r#"HTTP Proxy Gateway Debug ({hostname})
+            r#"HTTP/1.1 200 OK
 X-Upstream-Node: {internal_ip}:8080
-X-Internal-Auth-Bypass: {wp_nonce}
-X-Vault-Export-Path: {canary_endpoint_path}
-X-Canary-Callback: {canary_url}
+X-Internal-Gateway-Token: {crlf_gateway_token}
+X-Auth-Introspect-Url: {canary_url}
 "#
         ));
 
@@ -831,12 +993,14 @@ X-Canary-Callback: {canary_url}
             admin_user,
             db_secret_row,
             canary_token_id,
-            canary_api_key: wp_nonce,
+            canary_api_key: env_api_token,
             canary_aws_access_key: aws_access_key,
             canary_jwt_secret: jwt_secret,
-            canary_cookie_value: wp_cookie_hash.clone(),
+            canary_cookie_value: cookie_session_token,
             canary_endpoint_path,
             canary_url,
+            extra_canary_tokens,
+            extra_canary_paths,
             wp_version,
             wp_cookie_hash,
             wp_login_html,
@@ -859,14 +1023,21 @@ X-Canary-Callback: {canary_url}
             openapi_json,
             api_debug_json,
             canary_vault_export_json,
+            canary_admin_panel_html,
             sqli_error_mysql_html,
             sqli_error_postgres_html,
             sqli_boolean_true_html,
             sqli_boolean_false_html,
+            tarpit_gzip_header,
             tarpit_gzip_chunk,
+            tarpit_hprof_header,
             tarpit_hprof_chunk,
             lfi_etc_passwd_body,
             lfi_proc_environ_body,
+            win_ini_body,
+            boot_ini_body,
+            web_xml_body,
+            htaccess_body,
             ssrf_aws_imds_json,
             ssti_eval_html,
             nosql_dump_json,
@@ -893,6 +1064,9 @@ X-Canary-Callback: {canary_url}
         canary_endpoint_path: &str,
         canary_url: &str,
         fake_bcrypt: &str,
+        git_token: &str,
+        git_deploy_token: &str,
+        rng: &mut StdRng,
     ) -> ShellVfsData {
         let kernel_release = "5.15.0-91-generic".to_string();
         let kernel_uname = format!(
@@ -1207,6 +1381,86 @@ X-Canary-Callback: {canary_url}
                 &jwt_secret[..43]
             ),
         );
+        let ssh_priv_b64 = random_alnum(rng, 256, false);
+        files.insert(
+            format!("{home_dir}/.ssh/id_rsa"),
+            format!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+                 {}\n\
+                 {}\n\
+                 {}\n\
+                 {}\n\
+                 -----END OPENSSH PRIVATE KEY-----\n",
+                &ssh_priv_b64[0..64],
+                &ssh_priv_b64[64..128],
+                &ssh_priv_b64[128..192],
+                &ssh_priv_b64[192..256],
+            ),
+        );
+        files.insert(
+            "/etc/ssh/sshd_config".to_string(),
+            format!(
+                "# OpenSSH Server configuration ({hostname})\n\
+                 Include /etc/ssh/sshd_config.d/*.conf\n\
+                 Port 22\n\
+                 ListenAddress {internal_ip}\n\
+                 PermitRootLogin prohibit-password\n\
+                 PubkeyAuthentication yes\n\
+                 PasswordAuthentication no\n\
+                 KbdInteractiveAuthentication no\n\
+                 UsePAM yes\n\
+                 X11Forwarding no\n\
+                 PrintMotd no\n\
+                 AcceptEnv LANG LC_*\n\
+                 Subsystem sftp /usr/lib/openssh/sftp-server\n"
+            ),
+        );
+        files.insert(
+            "/etc/nginx/nginx.conf".to_string(),
+            format!(
+                "user www-data;\n\
+                 worker_processes auto;\n\
+                 pid /run/nginx.pid;\n\
+                 events {{ worker_connections 1024; }}\n\
+                 http {{\n\
+                 \tserver_tokens off;\n\
+                 \tupstream backend_pool {{ server {internal_ip}:8080; }}\n\
+                 \tserver {{\n\
+                 \t\tlisten 80 default_server;\n\
+                 \t\tserver_name {hostname}.internal.corp;\n\
+                 \t\tlocation / {{ proxy_pass http://backend_pool; }}\n\
+                 \t}}\n\
+                 }}\n"
+            ),
+        );
+        files.insert("/etc/crontab".to_string(), crontab_output.clone());
+        files.insert(
+            "/proc/cmdline".to_string(),
+            "BOOT_IMAGE=/boot/vmlinuz-5.15.0-91-generic root=UUID=8f91a2c4-e102-4a1c-8e9d-2b7410a9f801 ro quiet splash\n".to_string(),
+        );
+        files.insert(
+            "/proc/self/cmdline".to_string(),
+            format!("/usr/local/bin/app-gateway\0--listen\0{internal_ip}:8080\0--env\0production\0"),
+        );
+        files.insert(
+            "/.git/config".to_string(),
+            format!(
+                "[core]\n\
+                 \trepositoryformatversion = 0\n\
+                 \tfilemode = true\n\
+                 \tbare = false\n\
+                 [remote \"origin\"]\n\
+                 \turl = https://oauth2:{git_token}@git.internal.corp/{hostname}/monorepo.git\n\
+                 \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+                 [deploy]\n\
+                 \tregistry = registry.internal.corp/{hostname}\n\
+                 \tapiToken = {git_deploy_token}\n"
+            ),
+        );
+        files.insert(
+            "/.git/HEAD".to_string(),
+            "ref: refs/heads/release/prod-hotfix\n".to_string(),
+        );
         files.insert(
             format!("{home_dir}/deploy_notes.txt"),
             format!(
@@ -1227,9 +1481,9 @@ X-Canary-Callback: {canary_url}
                  AWS_SECRET = \"{aws_secret_key}\"\n\
                  ADMIN_API_TOKEN = \"{canary_api_key}\"\n\
                  VAULT_EXPORT_URI = \"{canary_endpoint_path}\"\n\
-                 CANARY_WEBHOOK = \"{canary_url}\"\n\
+                 AUTH_CALLBACK_URL = \"{canary_url}\"\n\
                  if __name__ == '__main__':\n\
-                     print(f'Syncing vault secrets for {{os.uname().nodename}} to {{CANARY_WEBHOOK}}...')\n"
+                     print(f'Syncing vault secrets for {{os.uname().nodename}} to {{AUTH_CALLBACK_URL}}...')\n"
             ),
         );
         files.insert(
@@ -1285,10 +1539,12 @@ X-Canary-Callback: {canary_url}
         directories.insert(
             "/etc".to_string(),
             vec![
+                "crontab".to_string(),
                 "group".to_string(),
                 "hostname".to_string(),
                 "hosts".to_string(),
                 "issue".to_string(),
+                "nginx".to_string(),
                 "os-release".to_string(),
                 "passwd".to_string(),
                 "resolv.conf".to_string(),
@@ -1296,6 +1552,8 @@ X-Canary-Callback: {canary_url}
                 "ssh".to_string(),
             ],
         );
+        directories.insert("/etc/ssh".to_string(), vec!["sshd_config".to_string()]);
+        directories.insert("/etc/nginx".to_string(), vec!["nginx.conf".to_string()]);
         directories.insert("/home".to_string(), vec![admin_user.to_string()]);
         directories.insert(
             home_dir.clone(),
@@ -1311,7 +1569,11 @@ X-Canary-Callback: {canary_url}
         );
         directories.insert(
             format!("{home_dir}/.ssh"),
-            vec!["authorized_keys".to_string(), "known_hosts".to_string()],
+            vec![
+                "authorized_keys".to_string(),
+                "id_rsa".to_string(),
+                "known_hosts".to_string(),
+            ],
         );
         directories.insert(
             format!("{home_dir}/.aws"),
@@ -1408,7 +1670,7 @@ X-Canary-Callback: {canary_url}
              define('AWS_SECRET_ACCESS_KEY', '{aws_secret_key}');\n\
              define('INTERNAL_API_BYPASS_TOKEN', '{canary_api_key}');\n\
              define('INTERNAL_VAULT_EXPORT_PATH', '{canary_endpoint_path}');\n\
-             define('CANARY_PING', '{canary_url}');\n\
+             define('SSO_VERIFY_ENDPOINT', '{canary_url}');\n\
              // Node: {hostname}\n"
         )
         .into_bytes()
