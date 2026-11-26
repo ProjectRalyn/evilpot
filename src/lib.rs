@@ -419,4 +419,138 @@ mod tests {
         .unwrap();
         assert!(admin_html.contains("Admin Console"));
     }
+
+    #[tokio::test]
+    async fn test_repeated_identical_probe_never_escalates_to_multistep() {
+        let engine = EvilpotEngine::new(EvilpotConfig::default());
+        let ip: IpAddr = "203.0.113.41".parse().unwrap();
+        let headers = HeaderMap::new();
+        let payload = "id=1'";
+
+        let first = engine
+            .handle_attack(
+                ip,
+                "GET",
+                "/item",
+                Some(payload),
+                &headers,
+                AttackSignal::new(AttackCategory::SqlInjection, "query", 0.9).with_payload(payload),
+            )
+            .await;
+        assert_eq!(first.session.status, ExploitVerificationStatus::Probing);
+
+        // Retrying the exact same request (e.g. a legitimate user hitting a WAF false
+        // positive) must never count as multi-step progress.
+        for _ in 0..3 {
+            let again = engine
+                .handle_attack(
+                    ip,
+                    "GET",
+                    "/item",
+                    Some(payload),
+                    &headers,
+                    AttackSignal::new(AttackCategory::SqlInjection, "query", 0.9)
+                        .with_payload(payload),
+                )
+                .await;
+            assert_eq!(
+                again.session.status,
+                ExploitVerificationStatus::Probing,
+                "identical retries must not escalate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_distinct_sqli_payloads_and_technique_switches_escalate() {
+        // Two different SQLi payloads of the same flavour -> multi-step.
+        let engine = EvilpotEngine::new(EvilpotConfig::default());
+        let ip: IpAddr = "203.0.113.42".parse().unwrap();
+        let headers = HeaderMap::new();
+        for payload in ["id=1'", "id=2'"] {
+            engine
+                .handle_attack(
+                    ip,
+                    "GET",
+                    "/item",
+                    Some(payload),
+                    &headers,
+                    AttackSignal::new(AttackCategory::SqlInjection, "query", 0.9)
+                        .with_payload(payload),
+                )
+                .await;
+        }
+        let report = engine.session_report(ip).unwrap();
+        assert!(report.status >= ExploitVerificationStatus::MultiStepExploitation);
+        assert_eq!(
+            report.sqli_distinct_positions, 0,
+            "no blind extraction position was recovered"
+        );
+
+        // Switching from SQLi to XSS is also multi-step.
+        let engine2 = EvilpotEngine::new(EvilpotConfig::default());
+        let ip2: IpAddr = "203.0.113.43".parse().unwrap();
+        engine2
+            .handle_attack(
+                ip2,
+                "GET",
+                "/item",
+                Some("id=1'"),
+                &headers,
+                AttackSignal::new(AttackCategory::SqlInjection, "query", 0.9).with_payload("id=1'"),
+            )
+            .await;
+        engine2
+            .handle_attack(
+                ip2,
+                "GET",
+                "/search",
+                Some("q=<script>alert(1)</script>"),
+                &headers,
+                AttackSignal::new(AttackCategory::Xss, "query", 0.9)
+                    .with_payload("<script>alert(1)</script>"),
+            )
+            .await;
+        let report2 = engine2.session_report(ip2).unwrap();
+        assert!(report2.status >= ExploitVerificationStatus::MultiStepExploitation);
+    }
+
+    #[tokio::test]
+    async fn test_repeated_rce_command_does_not_escalate_but_distinct_commands_do() {
+        let engine = EvilpotEngine::new(EvilpotConfig::default());
+        let ip: IpAddr = "203.0.113.44".parse().unwrap();
+        let headers = HeaderMap::new();
+        let repeated = "host=127.0.0.1; id";
+        for _ in 0..3 {
+            let out = engine
+                .handle_attack(
+                    ip,
+                    "GET",
+                    "/ping",
+                    Some(repeated),
+                    &headers,
+                    AttackSignal::new(AttackCategory::CommandInjection, "query", 0.98)
+                        .with_payload(repeated),
+                )
+                .await;
+            assert_eq!(out.session.status, ExploitVerificationStatus::Probing);
+        }
+
+        let second = "host=127.0.0.1; whoami";
+        let out = engine
+            .handle_attack(
+                ip,
+                "GET",
+                "/ping",
+                Some(second),
+                &headers,
+                AttackSignal::new(AttackCategory::CommandInjection, "query", 0.98)
+                    .with_payload(second),
+            )
+            .await;
+        assert_eq!(
+            out.session.status,
+            ExploitVerificationStatus::MultiStepExploitation
+        );
+    }
 }

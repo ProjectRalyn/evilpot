@@ -4,6 +4,7 @@ use crate::shell::{FakeShellSession, ShellExecResult};
 use crate::trap::TrapVerdict;
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
@@ -19,6 +20,73 @@ const MAX_DISTINCT_PATHS: usize = 128;
 const MAX_RCE_COMMANDS: usize = 128;
 const MAX_CAPTURED_IOCS: usize = 256;
 const MAX_EVIDENCE: usize = 128;
+const MAX_DISTINCT_SIGNATURES: usize = 256;
+const MAX_ATTACK_KINDS: usize = 16;
+const MAX_SQLI_TECHNIQUES: usize = 8;
+
+/// Coarse attack family, used to detect an attacker switching techniques (SQLi → RCE → LFI).
+fn attack_kind(verdict: &TrapVerdict) -> &'static str {
+    match verdict {
+        TrapVerdict::SqlInjectionBoolean { .. }
+        | TrapVerdict::SqlInjectionTimeBlind { .. }
+        | TrapVerdict::SqlInjectionError { .. } => "sqli",
+        TrapVerdict::CommandInjectionRce { .. } => "rce",
+        TrapVerdict::PathTraversalLfi { .. } => "lfi",
+        TrapVerdict::SsrfCloudMetadata { .. } => "ssrf",
+        TrapVerdict::SstiTemplateEval { .. } => "ssti",
+        TrapVerdict::NoSqlAdminDump { .. } => "nosql",
+        TrapVerdict::XxeEntityLeak { .. } => "xxe",
+        TrapVerdict::DeserializationJndiTrap { .. } => "jndi",
+        TrapVerdict::LdapDirectoryDump { .. } => "ldap",
+        TrapVerdict::XssBaitPage { .. } => "xss",
+        TrapVerdict::CrlfProxyDebug { .. } => "crlf",
+        TrapVerdict::CanaryVaultExport { .. } => "canary",
+        TrapVerdict::TarpitStream { .. } => "tarpit",
+        _ => "recon",
+    }
+}
+
+/// SQLi flavour (boolean / time-blind / error), used for technique-diversity checks.
+fn sqli_technique(verdict: &TrapVerdict) -> Option<&'static str> {
+    match verdict {
+        TrapVerdict::SqlInjectionBoolean { .. } => Some("boolean"),
+        TrapVerdict::SqlInjectionTimeBlind { .. } => Some("time_blind"),
+        TrapVerdict::SqlInjectionError { .. } => Some("error"),
+        _ => None,
+    }
+}
+
+/// Fingerprint of the concrete request content (trap kind + path + method/URI).
+///
+/// Multi-step verification must be driven by *different* payloads: a client that retries the
+/// exact same request (e.g. a legitimate user hitting a false-positive WAF rule) produces the
+/// same signature and therefore never escalates the session.
+fn request_signature(verdict: &TrapVerdict, path: &str, detail: &str) -> u64 {
+    // `detail` looks like "GET /item?id=1' [category=sql_injection loc=query conf=0.92]";
+    // the trailing analysis metadata is dropped so identical requests hash identically.
+    let request_part = detail.split(" [category=").next().unwrap_or(detail);
+    let mut h = DefaultHasher::new();
+    std::mem::discriminant(verdict).hash(&mut h);
+    path.hash(&mut h);
+    request_part.hash(&mut h);
+    h.finish()
+}
+
+fn note_sqli_payload(
+    session: &mut AttackerSessionState,
+    signature: u64,
+    new_signature: bool,
+    technique: Option<&'static str>,
+) {
+    if let Some(t) = technique {
+        if session.sqli_techniques.len() < MAX_SQLI_TECHNIQUES {
+            session.sqli_techniques.insert(t);
+        }
+    }
+    if new_signature && session.sqli_payloads.len() < MAX_DISTINCT_SIGNATURES {
+        session.sqli_payloads.insert(signature);
+    }
+}
 
 /// Verification status indicating how strongly `evilpot` has confirmed that a WAF-diverted
 /// client is actively exploiting a vulnerability rather than triggering an isolated false positive.
@@ -100,6 +168,14 @@ struct AttackerSessionState {
     canary_triggers: u32,
     sqli_probes: u32,
     sqli_positions: HashSet<usize>,
+    /// Distinct SQLi payloads (request signatures) seen in this session.
+    sqli_payloads: HashSet<u64>,
+    /// Distinct SQLi flavours (boolean / time-blind / error).
+    sqli_techniques: HashSet<&'static str>,
+    /// All distinct request signatures seen, so retries of the same request are ignored.
+    request_signatures: HashSet<u64>,
+    /// Coarse attack families exercised by this client (sqli / rce / lfi / xss ...).
+    attack_kinds: HashSet<&'static str>,
     rce_commands: Vec<String>,
     captured_iocs: Vec<String>,
     distinct_paths: HashSet<String>,
@@ -122,6 +198,10 @@ impl AttackerSessionState {
             canary_triggers: 0,
             sqli_probes: 0,
             sqli_positions: HashSet::new(),
+            sqli_payloads: HashSet::new(),
+            sqli_techniques: HashSet::new(),
+            request_signatures: HashSet::new(),
+            attack_kinds: HashSet::new(),
             rce_commands: Vec::new(),
             captured_iocs: Vec::new(),
             distinct_paths: HashSet::new(),
@@ -463,22 +543,45 @@ impl EvilpotEngine {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
-            // 2. Track SQLi blind extraction or multi-probe progression
+            // Fingerprint of this concrete request. Repeated identical submissions must not
+            // count as multi-step progress: a legitimate client retrying after a WAF false
+            // positive would otherwise be escalated and auto-banned.
+            let signature = request_signature(verdict, path, &detail_str);
+            let new_signature = if session.request_signatures.contains(&signature) {
+                false
+            } else {
+                if session.request_signatures.len() < MAX_DISTINCT_SIGNATURES {
+                    session.request_signatures.insert(signature);
+                }
+                true
+            };
+            if session.attack_kinds.len() < MAX_ATTACK_KINDS {
+                session.attack_kinds.insert(attack_kind(verdict));
+            }
+
+            // 2. Payload-diverse progression inside the primary technique families.
             match verdict {
                 TrapVerdict::SqlInjectionBoolean { extracted_pos, .. } => {
                     session.sqli_probes += 1;
                     if let Some(pos) = extracted_pos {
                         session.sqli_positions.insert(*pos);
                     }
-                    if session.sqli_probes >= 2 || !session.sqli_positions.is_empty() {
-                        if session.status < ExploitVerificationStatus::MultiStepExploitation {
-                            session.status = ExploitVerificationStatus::MultiStepExploitation;
-                        }
-                        if session.sqli_positions.len() >= 2 || session.sqli_probes >= 4 {
-                            session.status = ExploitVerificationStatus::VerifiedExploit;
-                        }
+                    note_sqli_payload(session, signature, new_signature, sqli_technique(verdict));
+                    let distinct_payloads = session.sqli_payloads.len();
+                    let distinct_techniques = session.sqli_techniques.len();
+                    // Different payloads / different SQLi flavours == genuine multi-step probing.
+                    if (distinct_payloads >= 2 || distinct_techniques >= 2)
+                        && session.status < ExploitVerificationStatus::MultiStepExploitation
+                    {
+                        session.status = ExploitVerificationStatus::MultiStepExploitation;
+                    }
+                    // Two distinct extracted character positions == real blind extraction.
+                    if session.sqli_positions.len() >= 2 {
+                        session.status = ExploitVerificationStatus::VerifiedExploit;
+                    }
+                    if new_signature {
                         let ev = VerificationEvidence::SqliExtractionProgress {
-                            probe_count: session.sqli_probes,
+                            probe_count: distinct_payloads as u32,
                             distinct_char_positions: session.sqli_positions.len(),
                         };
                         session.push_evidence(ev.clone());
@@ -487,12 +590,17 @@ impl EvilpotEngine {
                 }
                 TrapVerdict::SqlInjectionTimeBlind { .. } | TrapVerdict::SqlInjectionError { .. } => {
                     session.sqli_probes += 1;
-                    if session.sqli_probes >= 2
+                    note_sqli_payload(session, signature, new_signature, sqli_technique(verdict));
+                    let distinct_payloads = session.sqli_payloads.len();
+                    let distinct_techniques = session.sqli_techniques.len();
+                    if (distinct_payloads >= 2 || distinct_techniques >= 2)
                         && session.status < ExploitVerificationStatus::MultiStepExploitation
                     {
                         session.status = ExploitVerificationStatus::MultiStepExploitation;
+                    }
+                    if new_signature {
                         let ev = VerificationEvidence::SqliExtractionProgress {
-                            probe_count: session.sqli_probes,
+                            probe_count: distinct_payloads as u32,
                             distinct_char_positions: session.sqli_positions.len(),
                         };
                         session.push_evidence(ev.clone());
@@ -500,7 +608,10 @@ impl EvilpotEngine {
                     }
                 }
                 TrapVerdict::CommandInjectionRce { extracted_cmd, .. } => {
-                    if session.rce_commands.len() < MAX_RCE_COMMANDS {
+                    // Only *distinct* commands prove an interactive shell; retrying the same
+                    // command (e.g. `id` twice) is not multi-step exploitation.
+                    let cmd_is_new = !session.rce_commands.iter().any(|c| c == extracted_cmd);
+                    if cmd_is_new && session.rce_commands.len() < MAX_RCE_COMMANDS {
                         session.rce_commands.push(extracted_cmd.clone());
                     }
                     let mut iocs = Vec::new();
@@ -514,23 +625,36 @@ impl EvilpotEngine {
                             iocs.push(ioc.clone());
                         }
                     }
-                    if !iocs.is_empty() || session.rce_commands.len() >= 2 {
+                    // Payload delivery inside the fake shell (wget/curl/…) is deterministic proof.
+                    if !iocs.is_empty() {
                         session.status = ExploitVerificationStatus::VerifiedExploit;
-                    } else if session.status < ExploitVerificationStatus::MultiStepExploitation {
+                    } else if cmd_is_new
+                        && session.rce_commands.len() >= 2
+                        && session.status < ExploitVerificationStatus::MultiStepExploitation
+                    {
                         session.status = ExploitVerificationStatus::MultiStepExploitation;
                     }
-                    let ev = VerificationEvidence::RceShellInteraction {
-                        command_count: session.rce_commands.len() as u32,
-                        last_command: extracted_cmd.clone(),
-                        captured_iocs: iocs,
-                    };
-                    session.push_evidence(ev.clone());
-                    new_evidence.push(ev);
+                    if cmd_is_new {
+                        let ev = VerificationEvidence::RceShellInteraction {
+                            command_count: session.rce_commands.len() as u32,
+                            last_command: extracted_cmd.clone(),
+                            captured_iocs: iocs,
+                        };
+                        session.push_evidence(ev.clone());
+                        new_evidence.push(ev);
+                    }
                 }
                 _ => {}
             }
 
-            // 3. Multi-path recon across 3+ distinct sensitive routes
+            // 3. Switching attack techniques (SQLi → XSS → RCE …) is itself multi-step.
+            if session.attack_kinds.len() >= 2
+                && session.status < ExploitVerificationStatus::MultiStepExploitation
+            {
+                session.status = ExploitVerificationStatus::MultiStepExploitation;
+            }
+
+            // 4. Multi-path recon across 3+ distinct sensitive routes
             if session.distinct_paths.len() >= 3
                 && session.status < ExploitVerificationStatus::MultiStepExploitation
             {
