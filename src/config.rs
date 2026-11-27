@@ -40,6 +40,13 @@ pub struct EvilpotConfig {
     pub emit_persona_headers: bool,
     /// Maximum number of active attacker verification sessions tracked in memory (LRU-bounded).
     pub max_tracked_sessions: usize,
+    /// Number of *distinct* attack requests (differing payload / path / method) an attacker must
+    /// submit within one verification session before the session can escalate to
+    /// `MultiStepExploitation` (which callers such as Exposure turn into an auto-ban).
+    ///
+    /// Repeated identical requests never count. Values below 2 are treated as 2, since a single
+    /// request can never be "multi-step". Default: 2.
+    pub multi_step_min_distinct_requests: usize,
     /// Management & telemetry panel configuration (customizable / randomized secret URL).
     pub admin: AdminPanelConfig,
 }
@@ -60,6 +67,7 @@ impl Default for EvilpotConfig {
             server_header: None,
             emit_persona_headers: true,
             max_tracked_sessions: 4096,
+            multi_step_min_distinct_requests: 2,
             admin: AdminPanelConfig::default(),
         }
     }

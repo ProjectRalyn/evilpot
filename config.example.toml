@@ -12,6 +12,10 @@ canary_webhook_url = "https://sso-auth.internal.corp/v1/introspect"
 # server_header = "nginx"
 emit_persona_headers = true
 max_tracked_sessions = 4096
+# How many *distinct* attack requests (different payload / path / method) one client must submit
+# before its session can escalate to MultiStepExploitation (which callers turn into an auto-ban).
+# Identical retries never count. Minimum 2.
+multi_step_min_distinct_requests = 2
 
 [admin]
 enabled = true

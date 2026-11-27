@@ -516,6 +516,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_multi_step_distinct_request_threshold_is_configurable() {
+        // Require 4 distinct attack requests before multi-step escalation (default is 2).
+        let mut cfg = EvilpotConfig::default();
+        cfg.multi_step_min_distinct_requests = 4;
+        let engine = EvilpotEngine::new(cfg);
+        let ip: IpAddr = "203.0.113.45".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        for payload in ["id=1'", "id=2'", "id=3'"] {
+            let out = engine
+                .handle_attack(
+                    ip,
+                    "GET",
+                    "/item",
+                    Some(payload),
+                    &headers,
+                    AttackSignal::new(AttackCategory::SqlInjection, "query", 0.9)
+                        .with_payload(payload),
+                )
+                .await;
+            assert_eq!(
+                out.session.status,
+                ExploitVerificationStatus::Probing,
+                "3 distinct requests are below the configured threshold of 4"
+            );
+        }
+
+        let payload = "id=4'";
+        let out = engine
+            .handle_attack(
+                ip,
+                "GET",
+                "/item",
+                Some(payload),
+                &headers,
+                AttackSignal::new(AttackCategory::SqlInjection, "query", 0.9)
+                    .with_payload(payload),
+            )
+            .await;
+        assert_eq!(
+            out.session.status,
+            ExploitVerificationStatus::MultiStepExploitation,
+            "the 4th distinct request must reach the configured threshold"
+        );
+    }
+
+    #[tokio::test]
     async fn test_repeated_rce_command_does_not_escalate_but_distinct_commands_do() {
         let engine = EvilpotEngine::new(EvilpotConfig::default());
         let ip: IpAddr = "203.0.113.44".parse().unwrap();

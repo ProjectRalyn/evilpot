@@ -515,6 +515,10 @@ impl EvilpotEngine {
         let detail_str = detail.into();
         let mut new_evidence = Vec::new();
         let mut upgraded_to_verified = false;
+        // Global precondition for any multi-step escalation: the attacker must have submitted at
+        // least this many *distinct* attack requests. Configurable; a single request can never be
+        // "multi-step", so values below 2 are clamped.
+        let min_distinct_requests = self.config.multi_step_min_distinct_requests.max(2);
 
         let report = {
             let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
@@ -558,6 +562,9 @@ impl EvilpotEngine {
             if session.attack_kinds.len() < MAX_ATTACK_KINDS {
                 session.attack_kinds.insert(attack_kind(verdict));
             }
+            // Only escalate once the attacker submitted enough *distinct* requests. Identical
+            // retries captured above never increase this count.
+            let enough_distinct = session.request_signatures.len() >= min_distinct_requests;
 
             // 2. Payload-diverse progression inside the primary technique families.
             match verdict {
@@ -570,7 +577,8 @@ impl EvilpotEngine {
                     let distinct_payloads = session.sqli_payloads.len();
                     let distinct_techniques = session.sqli_techniques.len();
                     // Different payloads / different SQLi flavours == genuine multi-step probing.
-                    if (distinct_payloads >= 2 || distinct_techniques >= 2)
+                    if enough_distinct
+                        && (distinct_payloads >= 2 || distinct_techniques >= 2)
                         && session.status < ExploitVerificationStatus::MultiStepExploitation
                     {
                         session.status = ExploitVerificationStatus::MultiStepExploitation;
@@ -593,7 +601,8 @@ impl EvilpotEngine {
                     note_sqli_payload(session, signature, new_signature, sqli_technique(verdict));
                     let distinct_payloads = session.sqli_payloads.len();
                     let distinct_techniques = session.sqli_techniques.len();
-                    if (distinct_payloads >= 2 || distinct_techniques >= 2)
+                    if enough_distinct
+                        && (distinct_payloads >= 2 || distinct_techniques >= 2)
                         && session.status < ExploitVerificationStatus::MultiStepExploitation
                     {
                         session.status = ExploitVerificationStatus::MultiStepExploitation;
@@ -629,6 +638,7 @@ impl EvilpotEngine {
                     if !iocs.is_empty() {
                         session.status = ExploitVerificationStatus::VerifiedExploit;
                     } else if cmd_is_new
+                        && enough_distinct
                         && session.rce_commands.len() >= 2
                         && session.status < ExploitVerificationStatus::MultiStepExploitation
                     {
@@ -648,14 +658,16 @@ impl EvilpotEngine {
             }
 
             // 3. Switching attack techniques (SQLi → XSS → RCE …) is itself multi-step.
-            if session.attack_kinds.len() >= 2
+            if enough_distinct
+                && session.attack_kinds.len() >= 2
                 && session.status < ExploitVerificationStatus::MultiStepExploitation
             {
                 session.status = ExploitVerificationStatus::MultiStepExploitation;
             }
 
             // 4. Multi-path recon across 3+ distinct sensitive routes
-            if session.distinct_paths.len() >= 3
+            if enough_distinct
+                && session.distinct_paths.len() >= 3
                 && session.status < ExploitVerificationStatus::MultiStepExploitation
             {
                 session.status = ExploitVerificationStatus::MultiStepExploitation;
